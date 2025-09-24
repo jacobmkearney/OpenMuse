@@ -51,35 +51,41 @@ EXPECTED_CHANNELS = {
 # Importantly, these channels types are likely indistinguishable from the data alone, so it is best to group them according to their data characteristics.
 
 EXPECTED_GROUPS = {
-    "CH256": set(
-        EXPECTED_CHANNELS["EEG"]
-        + EXPECTED_CHANNELS["AUX"]
-        + [
-            i + j
-            for i in EXPECTED_CHANNELS["EEG"]
-            for j in EXPECTED_CHANNELS["AUX"]
-            if j > 0
-        ]
+    "CH256": list(
+        set(
+            EXPECTED_CHANNELS["EEG"]
+            + EXPECTED_CHANNELS["AUX"]
+            + [
+                i + j
+                for i in EXPECTED_CHANNELS["EEG"]
+                for j in EXPECTED_CHANNELS["AUX"]
+                if j > 0
+            ]
+        )
     ),
-    "CH52": set(
-        EXPECTED_CHANNELS["ACC"]
-        + EXPECTED_CHANNELS["GYRO"]
-        + [
-            i + j
-            for i in EXPECTED_CHANNELS["ACC"]
-            for j in EXPECTED_CHANNELS["GYRO"]
-            if j > 0
-        ]
+    "CH52": list(
+        set(
+            EXPECTED_CHANNELS["ACC"]
+            + EXPECTED_CHANNELS["GYRO"]
+            + [
+                i + j
+                for i in EXPECTED_CHANNELS["ACC"]
+                for j in EXPECTED_CHANNELS["GYRO"]
+                if j > 0
+            ]
+        )
     ),
-    "CH64": set(
-        EXPECTED_CHANNELS["PPG"]
-        + EXPECTED_CHANNELS["OPTICS"]
-        + [
-            i + j
-            for i in EXPECTED_CHANNELS["PPG"]
-            for j in EXPECTED_CHANNELS["OPTICS"]
-            if j > 0
-        ]
+    "CH64": list(
+        set(
+            EXPECTED_CHANNELS["PPG"]
+            + EXPECTED_CHANNELS["OPTICS"]
+            + [
+                i + j
+                for i in EXPECTED_CHANNELS["PPG"]
+                for j in EXPECTED_CHANNELS["OPTICS"]
+                if j > 0
+            ]
+        )
     ),
 }
 
@@ -103,23 +109,48 @@ EXPECTED_BITS = {
 
 
 def decode_muse_method1(
-    line: bytes | str, timestamp: Optional[_dt.datetime] = None
+    data: bytes | str,
+    timestamp: Optional[_dt.datetime] = None,
+    config: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
-    """Decoding method based on Amused-py."""
+    """
+    This version integrates:
+    1.  Smart alignment search for CH256 (EEG) data, handling interleaved packets.
+    2.  Demultiplexing of CH64 (PPG) data into three distinct channels.
+    3.  Use of the 'config' parameter to determine CH256 channel grouping.
 
-    # --- Constants ---
+    """
+    res = {
+        "timestamp": timestamp or _dt.datetime.now(),
+        "ok": False,
+        "errors": 0,
+        "ch256_samples": 0,
+        "ch52_samples": 0,
+        "ch64_samples": 0,
+    }
+
+    # --- constants ---
     CH256_SEG_BYTES = 18
     CH256_PAIR_BYTES = 3
-    CH256_CENTER = 2048
     CH256_SAMPLE_MAX = 4095
+    CH256_CENTER = 2048
+    MIN_ALIGNED_RUN = 2
 
     CH64_20BIT_PAIR_BYTES = 5
     CH64_PLAUSIBLE_MIN = 10000
 
     CH52_TUPLE_BYTES = 12
+    CH52_DEFAULT_START_MIN = 4
+    CH52_MIN_SAMPLES = 2
 
-    # --- Minimal helpers ---
-    def _unpack_ch256_18b(seg: bytes):
+    # --- helpers ---
+    def _looks_like_ch256(seg: bytes) -> bool:
+        if len(seg) != CH256_SEG_BYTES:
+            return False
+        sample = (seg[0] << 4) | (seg[1] >> 4)
+        return 0 <= sample <= CH256_SAMPLE_MAX
+
+    def _unpack_ch256_18b(seg: bytes) -> List[int]:
         out = []
         for i in range(CH256_SEG_BYTES // CH256_PAIR_BYTES):
             b0, b1, b2 = seg[i * 3 : i * 3 + 3]
@@ -128,13 +159,7 @@ def decode_muse_method1(
             out.extend([s1 - CH256_CENTER, s2 - CH256_CENTER])
         return out
 
-    def _looks_like_ch256(seg: bytes) -> bool:
-        if len(seg) != CH256_SEG_BYTES:
-            return False
-        sample = (seg[0] << 4) | (seg[1] >> 4)
-        return 0 <= sample <= CH256_SAMPLE_MAX
-
-    def _unpack_ch64_pair(b: bytes, off: int):
+    def _unpack_ch64_pair(b: bytes, off: int) -> Optional[Tuple[int, int]]:
         if off + CH64_20BIT_PAIR_BYTES > len(b):
             return None
         b0, b1, b2, b3, b4 = b[off : off + 5]
@@ -142,88 +167,198 @@ def decode_muse_method1(
         v2 = ((b2 & 0x0F) << 16) | (b3 << 8) | b4
         return v1, v2
 
-    def _extract_ch52_bulk(data: bytes, start_min=4, min_samples=2):
+    def _best_ch256_alignment(data: bytes, start_min: int) -> Tuple[int, int]:
         n = len(data)
-        best = []
-        for base in range(start_min, n - CH52_TUPLE_BYTES):
+        best_off, best_run = -1, 0
+        for base in range(start_min, n - CH256_SEG_BYTES + 1):
+            off, run = base, 0
+            while off + CH256_SEG_BYTES <= n and _looks_like_ch256(
+                data[off : off + CH256_SEG_BYTES]
+            ):
+                run += 1
+                off += CH256_SEG_BYTES
+            if run > best_run:
+                best_run, best_off = run, base
+        return best_off, best_run
+
+    def _extract_ch52_bulk(data: bytes) -> int:
+        n = len(data)
+        best_run = 0
+        for base in range(CH52_DEFAULT_START_MIN, n - CH52_TUPLE_BYTES + 1):
+            count = 0
             off = base
-            items = []
             while off + CH52_TUPLE_BYTES <= n:
                 try:
-                    ax, ay, az, gx, gy, gz = struct.unpack_from(">hhhhhh", data, off)
-                except Exception:
+                    struct.unpack_from(">hhhhhh", data, off)
+                    count += 1
+                    off += CH52_TUPLE_BYTES
+                except struct.error:
                     break
-                items.append({"accel": [ax, ay, az], "gyro": [gx, gy, gz]})
-                off += CH52_TUPLE_BYTES
-            if len(items) > len(best):
-                best = items
-        return best if len(best) >= min_samples else []
+            if count > best_run:
+                best_run = count
+        return best_run if best_run >= CH52_MIN_SAMPLES else 0
 
-    # --- Input handling ---
-    if isinstance(line, str):
-        data = bytes.fromhex(line)
-    else:
-        data = line
-    if not data:
-        return {"timestamp": timestamp or _dt.datetime.now(), "packet_type": "EMPTY"}
+    # --- main decode ---
+    try:
+        data = bytes.fromhex(data) if isinstance(data, str) else data
+        if not data:
+            res["errors"] += 1
+            return res
 
-    b0 = data[0]
-    result: Dict[str, Any] = {
+        b0 = data[0]
+
+        # CH256
+        if b0 in {
+            0xDF,
+            0xE2,
+            0xE5,
+            0xEE,
+            0xEF,
+            0xF2,
+            0xD9,
+            0xDB,
+            0xCF,
+            0xCA,
+            0xCB,
+            0xCE,
+        }:
+            offset = 4
+            while offset < len(data):
+                base, run = _best_ch256_alignment(data, start_min=offset)
+                if base == -1 or run < MIN_ALIGNED_RUN:
+                    offset += 1
+                    continue
+                current_pos = base
+                while current_pos + CH256_SEG_BYTES <= len(data):
+                    seg = data[current_pos : current_pos + CH256_SEG_BYTES]
+                    if not _looks_like_ch256(seg):
+                        break
+                    samples = _unpack_ch256_18b(seg)
+                    res["ch256_samples"] += len(samples)
+                    current_pos += CH256_SEG_BYTES
+                offset = current_pos + CH256_SEG_BYTES
+
+        # CH64
+        elif b0 in {0xE3, 0xEC, 0xF0}:
+            offset = 4
+            while offset + CH64_20BIT_PAIR_BYTES <= len(data):
+                pair = _unpack_ch64_pair(data, offset)
+                if not pair:
+                    break
+                v1, v2 = pair
+                if all(CH64_PLAUSIBLE_MIN <= v < (1 << 20) for v in (v1, v2)):
+                    res["ch64_samples"] += 2
+                    offset += CH64_20BIT_PAIR_BYTES
+                else:
+                    break
+
+        # CH52 single
+        elif b0 in {0xF4, 0xDA}:
+            try:
+                struct.unpack_from(">hhhhhh", data, 4)
+                res["ch52_samples"] += 1
+            except struct.error:
+                res["errors"] += 1
+
+        # CH52 bulk
+        elif b0 in {0xD7, 0xD1, 0xD5, 0xDD}:
+            res["ch52_samples"] += _extract_ch52_bulk(data)
+
+    except Exception:
+        res["errors"] += 1
+        return res
+
+    if any((res["ch256_samples"], res["ch52_samples"], res["ch64_samples"])):
+        res["ok"] = True
+
+    return res
+
+
+def decode_muse_method2(
+    data: bytes | str,
+    timestamp: Optional[_dt.datetime] = None,
+    config: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
+    """Token-based decoding extracted from `analyze_file_with_config`.
+
+    Returns a standardized dict with keys: 'timestamp','ok','errors',
+    'ch256_samples','ch52_samples','ch64_samples'.
+    """
+    res = {
         "timestamp": timestamp or _dt.datetime.now(),
-        "packet_type": f"0x{b0:02X}",
+        "ok": False,
+        "errors": 0,
+        "ch256_samples": 0,
+        "ch52_samples": 0,
+        "ch64_samples": 0,
     }
-
-    # CH256 bulk frames
-    if b0 in (0xDF, 0xE2, 0xE5, 0xEE, 0xEF, 0xF2, 0xD9, 0xDB, 0xCF, 0xCA, 0xCB, 0xCE):
-        res = {"ch256": {}, "ch64": {}}
-        offset = 4
-        ch_idx = 0
-        while offset + CH256_SEG_BYTES <= len(data):
-            seg = data[offset : offset + 18]
-            if _looks_like_ch256(seg):
-                samples = _unpack_ch256_18b(seg)
-                key = f"CH256_{ch_idx+1}"
-                res["ch256"].setdefault(key, []).extend(samples)
-                ch_idx += 1
-                offset += 18
-            else:
-                offset += 1
-        result.update(res)
-
-    # CH64 packets
-    elif b0 in (0xE3, 0xEC, 0xF0):
-        res = {"ch64": {"CH64_1": [], "CH64_2": [], "CH64_3": []}}
-        offset, n = 4, len(data)
-        idx = 0
-        while offset + 5 <= n:
-            v = _unpack_ch64_pair(data, offset)
-            if not v:
-                break
-            v1, v2 = v
-            if all(CH64_PLAUSIBLE_MIN <= x < (1 << 20) for x in (v1, v2)):
-                ch1, ch2 = idx % 3, (idx + 1) % 3
-                res["ch64"][f"CH64_{ch1+1}"].append(v1)
-                res["ch64"][f"CH64_{ch2+1}"].append(v2)
-                idx += 2
-                offset += 5
-            else:
-                break
-        if idx >= 6:
-            result.update(res)
-
-    # CH52 packets
-    elif b0 in (0xF4, 0xDA):
+    # normalize to str
+    if isinstance(data, (bytes, bytearray)):
         try:
-            ax, ay, az, gx, gy, gz = struct.unpack_from(">hhhhhh", data, 4)
-            result["ch52"] = {"ACC": [ax, ay, az], "GYRO": [gx, gy, gz]}
+            s = data.decode("utf-8", errors="ignore").strip()
         except Exception:
-            pass
-    elif b0 in (0xD7, 0xD1, 0xD5, 0xDD):
-        batch = _extract_ch52_bulk(data, start_min=4)
-        if batch:
-            result["ch52_batch"] = batch
+            s = str(data).strip()
+    else:
+        s = str(data).strip()
+    if not s:
+        res["errors"] += 1
+        return res
 
-    return result
+    parts = [p for p in (s.split(",") if "," in s else s.split()) if p]
+    t = None
+    try:
+        if parts and ("." in parts[0] or parts[0].isdigit()):
+            t = float(parts[0])
+            parts = parts[1:]
+    except Exception:
+        res["errors"] += 1
+        return res
+    if t is not None:
+        res["timestamp"] = t
+
+    config = config or {"CH256": 0, "CH52": 0, "CH64": 0}
+    expected_tokens = (
+        config.get("CH256", 0) + config.get("CH52", 0) + config.get("CH64", 0)
+    )
+    num_tokens = len(parts)
+    if num_tokens != expected_tokens:
+        res["errors"] += 1
+        return res
+
+    # assign tokens
+    token_idx = 0
+    for group, count in config.items():
+        if count == 0:
+            continue
+        expected_bits = EXPECTED_BITS.get(group, 14)
+        for _ in range(count):
+            if token_idx >= num_tokens:
+                res["errors"] += 1
+                break
+            try:
+                val = float(parts[token_idx])
+                max_val = 2**expected_bits - 1
+                if abs(val) > max_val:
+                    res["errors"] += 1
+                else:
+                    if group == "CH256":
+                        res["ch256_samples"] += 1
+                    elif group == "CH52":
+                        res["ch52_samples"] += 1
+                    elif group == "CH64":
+                        res["ch64_samples"] += 1
+            except ValueError:
+                res["errors"] += 1
+            token_idx += 1
+
+    if res["errors"] == 0:
+        res["ok"] = True
+    return res
+
+
+METHODS = {"method1": decode_muse_method1, "method2": decode_muse_method2}
+
+# VALIDATION ====================================================================
 
 
 def _score_rates(inferred: Dict[str, float], expected: Dict[str, float]) -> float:
@@ -251,18 +386,16 @@ def _generate_config_candidates() -> List[Dict[str, int]]:
 
     Returns a list of dicts with keys: 'CH256','CH52','CH64'.
     """
-    ch256_choices = sorted(EXPECTED_GROUPS.get("CH256", []))
-    ch52_choices = sorted(EXPECTED_GROUPS.get("CH52", []))
-    ch64_choices = sorted(EXPECTED_GROUPS.get("CH64", []))
-
     candidates: List[Dict[str, int]] = []
-    for g256, g52, g64 in itertools.product(ch256_choices, ch52_choices, ch64_choices):
+    for g256, g52, g64 in itertools.product(
+        EXPECTED_GROUPS["CH256"], EXPECTED_GROUPS["CH52"], EXPECTED_GROUPS["CH64"]
+    ):
         candidates.append({"CH256": g256, "CH52": g52, "CH64": g64})
     return candidates
 
 
 def analyze_file_with_config(
-    lines: List[str], config: Optional[Dict[str, int]] = None
+    lines: List[str], config: Optional[Dict[str, int]] = None, decode_fn=None
 ) -> Dict[str, Any]:
     stats = {
         "lines": 0,
@@ -276,54 +409,38 @@ def analyze_file_with_config(
     }
     times: List[float] = []
     config = config or {"CH256": 0, "CH52": 0, "CH64": 0}
-    expected_tokens = (
-        config.get("CH256", 0) + config.get("CH52", 0) + config.get("CH64", 0)
-    )
 
+    decode_fn = decode_fn or decode_muse_method1
     for line in lines:
         stats["lines"] += 1
-        s = line.strip()
-        if not s:
+
+        # Unpack line: each line has three tab‑separated fields:
+        # - Timestamp (ISO 8601 with microseconds and timezone)
+        # - UUID / session ID
+        # - Hex payload (the actual Muse packet)
+        parts = line.strip().split("\t")
+        if len(parts) != 3:
+            print(f"Malformed line: {line}")
             continue
-        parts = [p for p in (s.split(",") if "," in s else s.split()) if p]
-        t = None
+        ts_str, uuid_str, hex_payload = parts[0], parts[1], parts[2]
+
+        # Parse
+        ts = _dt.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
         try:
-            if parts and ("." in parts[0] or parts[0].isdigit()):
-                t = float(parts[0])
-                parts = parts[1:]  # Remove timestamp
+            dec = decode_fn(hex_payload, timestamp=ts, config=config)
         except Exception:
             stats["errors"] += 1
             continue
-        if t is not None:
-            times.append(t)
 
-        # Validate token count against config
-        num_tokens = len(parts)
-        if num_tokens == expected_tokens:
+        # accumulate
+        times.append(ts.timestamp())
+
+        stats["errors"] += dec.get("errors", 0)
+        if dec.get("ok"):
             stats["decoded_lines"] += 1
-            # Assign tokens to groups based on config and bit resolution
-            token_idx = 0
-            for group, count in config.items():
-                if count == 0:
-                    continue
-                expected_bits = EXPECTED_BITS.get(group, 14)
-                for _ in range(count):
-                    if token_idx >= num_tokens:
-                        stats["errors"] += 1
-                        break
-                    try:
-                        val = float(parts[token_idx])
-                        # Check if value is within expected bit resolution range
-                        max_val = 2**expected_bits - 1
-                        if abs(val) > max_val:
-                            stats["errors"] += 1
-                        else:
-                            stats[f"{group.lower()}_samples"] += 1
-                    except ValueError:
-                        stats["errors"] += 1
-                    token_idx += 1
-        else:
-            stats["errors"] += 1
+        stats["ch256_samples"] += dec.get("ch256_samples", 0)
+        stats["ch52_samples"] += dec.get("ch52_samples", 0)
+        stats["ch64_samples"] += dec.get("ch64_samples", 0)
 
     # Rate estimation
     if len(times) >= 2:
@@ -340,7 +457,9 @@ def analyze_file_with_config(
     return stats
 
 
-def run_search_on_file(lines: List[str], file_label: str):
+def run_search_on_file(
+    lines: List[str], file_label: str, method="method1"
+) -> pd.DataFrame:
     """Try candidate channel configs and decoding strategies for one file.
 
     Returns a pandas.DataFrame-like list of records with scores and inferred rates.
@@ -349,7 +468,9 @@ def run_search_on_file(lines: List[str], file_label: str):
     records: List[Dict[str, Any]] = []
 
     for grp_cfg in candidates:
-        stats = analyze_file_with_config(lines, config=grp_cfg)
+        stats = analyze_file_with_config(
+            lines, config=grp_cfg, decode_fn=METHODS[method]
+        )
         rates = stats.get("rates", {})
         rate_score = _score_rates(
             rates,
@@ -405,6 +526,7 @@ def run_search_on_file(lines: List[str], file_label: str):
 
         rec = {
             "file": file_label,
+            "method": method,
             "group_config": grp_cfg,
             "score": score,
             "decoded_lines": stats.get("decoded_lines", 0),
@@ -420,6 +542,7 @@ def run_search_on_file(lines: List[str], file_label: str):
     for r in records:
         row = {
             "file": r["file"],
+            "method": r["method"],
             "score": r["score"],
             "decoded_lines": r["decoded_lines"],
             "errors": r["errors"],
@@ -504,41 +627,49 @@ if __name__ == "__main__":
         with open(full_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
         print(f"Processing {path}... (this may take a moment)")
-        try:
-            df: pd.DataFrame = run_search_on_file(lines, file_label=path)
-        except Exception as e:
-            print(f"Error processing {path}: {e}")
-            continue
-        if df is not None and not df.empty:
-            # compute perfectness summary for this file and annotate each row
-            summary = perfectness_score(df)
-            for k, v in summary.items():
-                df[f"summary_{k}"] = v
-            results.append(df)
+
+        for method in METHODS.keys():
+            print(f"  Using decoding method: {method}")
+            try:
+                df: pd.DataFrame = run_search_on_file(
+                    lines, file_label=path, method=method
+                )
+            except Exception as e:
+                print(f"Error processing {path}: {e}")
+                continue
+            if df is not None and not df.empty:
+                # compute perfectness summary for this file and annotate each row
+                summary = perfectness_score(df)
+                for k, v in summary.items():
+                    df[f"summary_{k}"] = v
+                results.append(df)
+
+    # Evaluate
     if not results:
         print("No results to plot.")
     else:
-        all_df = pd.concat(results, ignore_index=True)
-        all_df = all_df.reset_index(drop=True)
-        all_df["config"] = (
-            all_df["grp_CH256"].astype(str)
+        rez = pd.concat(results, ignore_index=True)
+        rez = rez.reset_index(drop=True)
+        rez["config"] = (
+            rez["grp_CH256"].astype(str)
             + "-"
-            + all_df["grp_CH52"].astype(str)
+            + rez["grp_CH52"].astype(str)
             + "-"
-            + all_df["grp_CH64"].astype(str)
+            + rez["grp_CH64"].astype(str)
         )
 
         # Visualize results for score
         import seaborn as sns
+        import matplotlib.pyplot as plt
 
-        # Normalize scores within each file
-        all_df["normalized_score"] = all_df.groupby("file")["score"].transform(
-            lambda x: (x - x.min()) / (x.max() - x.min() + 1e-12)
-        )
-        pivot = all_df.pivot_table(
-            index="file", columns="config", values="normalized_score", aggfunc="min"
-        )
-        plt.figure(figsize=(12, 8))
-        sns.heatmap(pivot)
-        plt.title("Normalized Score Heatmap")
-        plt.show()
+        rez["score_log"] = np.log1p(rez["score"])
+
+        for method, subdf in rez.groupby("method"):
+            pivot = subdf.pivot_table(
+                index="file", columns="config", values="score_log", aggfunc="min"
+            )
+            plt.figure(figsize=(12, 8))
+            sns.heatmap(pivot)
+            plt.title(f"Normalized Score Heatmap – {method}")
+            plt.gca().collections[0].set_clim(rez["score_log"].min(), rez["score_log"].max())
+            plt.show()
