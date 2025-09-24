@@ -105,7 +105,7 @@ EXPECTED_BITS = {
 def decode_muse_method1(
     line: bytes | str, timestamp: Optional[_dt.datetime] = None
 ) -> Dict[str, Any]:
-    """Decode one raw Muse BLE packet (hex string or bytes)."""
+    """Decoding method based on Amused-py."""
 
     # --- Constants ---
     CH256_SEG_BYTES = 18
@@ -173,7 +173,7 @@ def decode_muse_method1(
         "packet_type": f"0x{b0:02X}",
     }
 
-    # EEG/PPG bulk frames
+    # CH256 bulk frames
     if b0 in (0xDF, 0xE2, 0xE5, 0xEE, 0xEF, 0xF2, 0xD9, 0xDB, 0xCF, 0xCA, 0xCB, 0xCE):
         res = {"ch256": {}, "ch64": {}}
         offset = 4
@@ -190,7 +190,7 @@ def decode_muse_method1(
                 offset += 1
         result.update(res)
 
-    # Calibrated PPG
+    # CH64 packets
     elif b0 in (0xE3, 0xEC, 0xF0):
         res = {"ch64": {"CH64_1": [], "CH64_2": [], "CH64_3": []}}
         offset, n = 4, len(data)
@@ -211,7 +211,7 @@ def decode_muse_method1(
         if idx >= 6:
             result.update(res)
 
-    # IMU packets
+    # CH52 packets
     elif b0 in (0xF4, 0xDA):
         try:
             ax, ay, az, gx, gy, gz = struct.unpack_from(">hhhhhh", data, 4)
