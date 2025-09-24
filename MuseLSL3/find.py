@@ -7,7 +7,14 @@ def find_devices(timeout=10, verbose=True):
     if verbose:
         print(f"Searching for Muses (max. {timeout} seconds)...")
     devices = backend.scan(timeout=timeout)
-    muses = [d for d in devices if d.get("name") and "Muse" in d["name"]]
+    muses = []
+    for d in devices:
+        name = d.get("name")
+        try:
+            if isinstance(name, str) and "muse" in name.lower():
+                muses.append(d)
+        except Exception:
+            continue
 
     if verbose:
         if muses:

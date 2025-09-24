@@ -21,7 +21,7 @@ MuseLSL3 find --timeout 10
 ### Record data from the Muse S Athena
 
 ```powershell
-MuseLSL3 record --address 00:55:DA:B9:FA:20 --timeout 10 --outfile data.txt --preset p1035 --view
+MuseLSL3 record --address 00:55:DA:B9:FA:20 --timeout 10 --outfile data.txt --preset p1035
 ```
 
 Presets to test:
@@ -47,7 +47,7 @@ Notes:
 
 ## Decoding Information
 
-Muse S Athena specs (From the [Muse website](https://eu.choosemuse.com/products/muse-s-athena)):
+Muse S Athena specs (From the [Muse website](https://eu.choosemuse.com/products/muse-s-athena) - note that these info might not be up to date or fully accurate):
 - Wireless Connection: BLE 5.3, 2.4 GHz
 - EEG Channels: 4 EEG channels (TP9, AF7, AF8, TP10) + 1 (or 4?) amplified Aux channels
   - Sample Rate: 256 Hz
@@ -61,7 +61,7 @@ This means that there are potentially:
 - 5 channels sampled at 256Hz (4 EEG + 1 Aux) (possibly 8 if 4 Aux channels, to be confirmed)
 - 6 channels sampled at 52Hz (3 Acc + 3 Gyro)
 - 8 channels sampled at 64Hz (3 PPG, 5 fNIRS)
-
+Different presets may enable/disable some channels.
 
 
 ## Related Projects
@@ -71,4 +71,3 @@ This means that there are potentially:
 - MuseLSL2 PR #3: https://github.com/DominiqueMakowski/MuseLSL2/pull/3
 - https://mind-monitor.com/FAQ.php#oscspec
 - neuralencoding (uses an other app, but might contain useful information): https://github.com/BrianMohseni/neuralencoding
-

@@ -1,9 +1,8 @@
 import argparse
+import sys
 
 from .find import find_devices
 from .record import record
-
-# Decoder functionality removed in raw-only mode
 
 
 def _add_find_args(parser: argparse.ArgumentParser) -> None:
@@ -50,7 +49,6 @@ def main(argv=None):
     p_rec.add_argument(
         "--preset", default="p1035", help="Preset to send (e.g., p1035 or p21)"
     )
-    # Always subscribes to both data characteristics; no flag needed.
 
     def handle_record(ns):
         if ns.timeout <= 0:
@@ -66,7 +64,12 @@ def main(argv=None):
 
     p_rec.set_defaults(func=handle_record)
 
-    # decode subcommand removed in raw-only mode
-
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        print("Interrupted.")
+        return 130
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
