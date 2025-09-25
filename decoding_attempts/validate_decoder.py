@@ -9,6 +9,7 @@ import struct
 
 # STARTING INFO ====================================================================
 
+### Constructor Information
 
 # Muse S Athena specs (From the [Muse website](https://eu.choosemuse.com/products/muse-s-athena) - note that these info might not be up to date or fully accurate):
 # - Wireless Connection: BLE 5.3, 2.4 GHz
@@ -21,9 +22,12 @@ import struct
 # - fNIRS Sensor: 5-optode bilateral frontal cortex hemodynamics, 64 Hz sample rate, 20-bit resolution
 #   - Might result in 1, 4, 5, 8, 16 OPTICS channels
 
-# Different presets may enable/disable some channels.
+### Presets
 
-# Note: 1034 is the only preset for which a red LED brightly turned on during recording, suggesting the activation of OPTICS or PPG channels.
+# Different presets enable/disable some channels, but the exact combinations are not fully documented.
+# - p20-p61: Red LED in the centre is off
+# - p1034, p1041, p1042, p1043: red LED in the centre is brightly on (suggesting the activation of OPTICS or PPG channels)
+# - p1035, p1044, p1045, p4129: red LED in the centre is dimmer
 
 # Based on these specs, we can derive the following plausible expectations regarding each channel type:
 
@@ -356,7 +360,294 @@ def decode_muse_method2(
     return res
 
 
-METHODS = {"method1": decode_muse_method1, "method2": decode_muse_method2}
+def decode_muse_method3(
+    data: bytes | str,
+    timestamp: Optional[_dt.datetime] = None,
+    config: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
+    """
+    Athena-format decoder that also records unaccounted patterns and diagnostics:
+      - packet_id_counts: histogram of exact packet-id bytes seen
+      - unknown_high_nibbles / unknown_low_nibbles: counts of unmapped nibble values
+      - residuals: list of dicts {off, hex, n_bytes, reason}
+      - failed_unpacks: list of dicts {off, spec, reason}
+      - unpack_runs as before
+    """
+    # Exact Athena mappings and packet-id offsets (same as previous version)
+    ATHENA_RATE_NIBBLE_MAP = {
+        0x0: 0.0,
+        0x1: 64.0,
+        0x2: 128.0,
+        0x3: 256.0,
+        0x4: 52.0,
+        0x5: 32.0,
+        0x6: 16.0,
+        0x7: 8.0,
+        0x8: 1.0,
+    }
+    ATHENA_TYPE_NIBBLE_MAP = {
+        0x0: "EEG",
+        0x1: "IMU",
+        0x2: "OPTICAL",
+        0x3: "AUX",
+        0x4: "META",
+        0x5: "EEG_ALT",
+    }
+    PACKET_ID_OFFSETS = [4, 7, 5, 1, 0]
+
+    res = {
+        "timestamp": timestamp or _dt.datetime.now(),
+        "ok": False,
+        "errors": 0,
+        "ch256_samples": 0,
+        "ch52_samples": 0,
+        "ch64_samples": 0,
+        "packet_type": None,
+        "packet_rate": None,
+        "unpack_runs": [],
+        "notes": [],
+        # new diagnostics
+        "packet_id_counts": {},  # hex_byte -> count
+        "unknown_high_nibbles": {},  # nibble -> count
+        "unknown_low_nibbles": {},  # nibble -> count
+        "residuals": [],  # list of {off, hex, n_bytes, reason}
+        "failed_unpacks": [],  # list of {off, spec, reason}
+        "payload_len": 0,
+    }
+
+    def _to_bytes(data_in):
+        if isinstance(data_in, str):
+            try:
+                return bytes.fromhex(data_in)
+            except Exception:
+                return data_in.encode("utf-8", errors="ignore")
+        if isinstance(data_in, (bytes, bytearray)):
+            return bytes(data_in)
+        return str(data_in).encode("utf-8", errors="ignore")
+
+    def _read_bits(buf: bytes, bit_off: int, nbits: int) -> Tuple[int, int]:
+        total_bits = len(buf) * 8
+        if bit_off + nbits > total_bits:
+            raise ValueError("not enough bits")
+        start_byte = bit_off // 8
+        end_bit = bit_off + nbits
+        end_byte = (end_bit + 7) // 8
+        chunk = int.from_bytes(buf[start_byte:end_byte], "big")
+        right_bits = (8 * (end_byte - start_byte)) - (bit_off % 8 + nbits)
+        val = (chunk >> right_bits) & ((1 << nbits) - 1)
+        return val, bit_off + nbits
+
+    def _unpack_stream(
+        buf: bytes, bits_per_sample: int, signed: bool, expect_min: int = None
+    ):
+        vals = []
+        bit_off = 0
+        try:
+            while True:
+                v, bit_off = _read_bits(buf, bit_off, bits_per_sample)
+                if signed:
+                    sign_bit = 1 << (bits_per_sample - 1)
+                    if v & sign_bit:
+                        v = v - (1 << bits_per_sample)
+                vals.append(v)
+        except ValueError:
+            pass
+        if expect_min is not None and len(vals) < expect_min:
+            return []
+        return vals
+
+    try:
+        buf = _to_bytes(data)
+        res["payload_len"] = len(buf)
+        if not buf:
+            res["errors"] += 1
+            res["notes"].append("empty payload")
+            return res
+
+        # packet-id discovery and counting
+        packet_id = None
+        id_off = None
+        for off in PACKET_ID_OFFSETS:
+            if off < len(buf):
+                pid = buf[off]
+                # update packet-id histogram
+                pid_hex = f"{pid:02X}"
+                res["packet_id_counts"][pid_hex] = (
+                    res["packet_id_counts"].get(pid_hex, 0) + 1
+                )
+
+                high = (pid >> 4) & 0x0F
+                low = pid & 0x0F
+                high_known = high in ATHENA_RATE_NIBBLE_MAP
+                low_known = low in ATHENA_TYPE_NIBBLE_MAP
+                if not high_known:
+                    res["unknown_high_nibbles"][f"{high:X}"] = (
+                        res["unknown_high_nibbles"].get(f"{high:X}", 0) + 1
+                    )
+                if not low_known:
+                    res["unknown_low_nibbles"][f"{low:X}"] = (
+                        res["unknown_low_nibbles"].get(f"{low:X}", 0) + 1
+                    )
+
+                if high_known or low_known:
+                    packet_id = pid
+                    id_off = off
+                    break
+
+        if packet_id is None:
+            # still record the first byte as seen id
+            pid = buf[0]
+            pid_hex = f"{pid:02X}"
+            res["packet_id_counts"][pid_hex] = (
+                res["packet_id_counts"].get(pid_hex, 0) + 1
+            )
+            packet_id = pid
+            id_off = 0
+
+        high = (packet_id >> 4) & 0x0F
+        low = packet_id & 0x0F
+        rate = ATHENA_RATE_NIBBLE_MAP.get(high)
+        ptype = ATHENA_TYPE_NIBBLE_MAP.get(low, None)
+        res["packet_type"] = ptype
+        res["packet_rate"] = rate
+
+        # choose unpack spec or try inference
+        if ptype in ("EEG", "EEG_ALT"):
+            bits, signed, expect_min, out_key = 14, True, 2, "ch256_samples"
+        elif ptype == "IMU":
+            bits, signed, expect_min, out_key = 12, True, 3, "ch52_samples"
+        elif ptype == "OPTICAL":
+            bits, signed, expect_min, out_key = 20, False, 2, "ch64_samples"
+        elif ptype == "AUX":
+            bits, signed, expect_min, out_key = 14, True, 1, "ch256_samples"
+        else:
+            # try canonical specs, but record failures
+            best_n = 0
+            best_spec = None
+            for b, s, key, minv in (
+                (14, True, "ch256_samples", 2),
+                (12, True, "ch52_samples", 3),
+                (20, False, "ch64_samples", 2),
+            ):
+                try:
+                    vals = _unpack_stream(buf[id_off + 1 :], b, s, expect_min=minv)
+                except Exception as e:
+                    res["failed_unpacks"].append(
+                        {"off": id_off, "spec": (b, s), "reason": str(e)}
+                    )
+                    vals = []
+                if len(vals) > best_n:
+                    best_n = len(vals)
+                    best_spec = (b, s, key, minv, vals)
+            if best_spec is None or best_n == 0:
+                res["errors"] += 1
+                res["notes"].append(
+                    "unable to unpack with canonical specs; storing residual"
+                )
+                res["residuals"].append(
+                    {
+                        "off": id_off,
+                        "hex": buf[id_off:].hex(),
+                        "n_bytes": len(buf) - id_off,
+                        "reason": "no valid unpack produced expected min samples",
+                    }
+                )
+                return res
+            bits, signed, out_key, expect_min, vals = best_spec
+            nvals = len(vals)
+            res["unpack_runs"].append(
+                {
+                    "off": id_off,
+                    "type": ptype or "INFERRED",
+                    "rate": rate,
+                    "n_values": nvals,
+                }
+            )
+            if out_key == "ch256_samples":
+                res["ch256_samples"] += nvals
+            elif out_key == "ch52_samples":
+                res["ch52_samples"] += nvals
+            elif out_key == "ch64_samples":
+                res["ch64_samples"] += nvals
+            res["ok"] = nvals > 0
+            return res
+
+        # perform unpacking for chosen spec
+        payload = buf[id_off + 1 :]
+        try:
+            vals = _unpack_stream(payload, bits, signed, expect_min=expect_min)
+        except Exception as e:
+            res["failed_unpacks"].append(
+                {"off": id_off, "spec": (bits, signed), "reason": str(e)}
+            )
+            vals = []
+
+        nvals = len(vals)
+        if nvals == 0:
+            # record residual for later inspection
+            res["residuals"].append(
+                {
+                    "off": id_off,
+                    "hex": payload.hex(),
+                    "n_bytes": len(payload),
+                    "reason": f"unpack returned 0 vals for spec bits={bits}, signed={signed}",
+                }
+            )
+            res["errors"] += 1
+            res["notes"].append("unpack produced no values; residual recorded")
+            return res
+
+        # heuristic recentering for 14-bit EEG unsigned patterns
+        if bits == 14 and nvals > 0:
+            abs_median = float(np.median(np.abs(vals)))
+            if abs_median > (1 << (bits - 2)):
+                vals = [v - (1 << bits) if v >= (1 << (bits - 1)) else v for v in vals]
+
+        if out_key == "ch256_samples":
+            res["ch256_samples"] += nvals
+        elif out_key == "ch52_samples":
+            res["ch52_samples"] += nvals
+        elif out_key == "ch64_samples":
+            res["ch64_samples"] += nvals
+
+        res["unpack_runs"].append(
+            {"off": id_off, "type": ptype, "rate": rate, "n_values": nvals}
+        )
+
+        # if there are leftover bytes that weren't consumed as full samples, record them
+        total_bits_consumed = nvals * bits
+        leftover_bits = (len(payload) * 8) - total_bits_consumed
+        if leftover_bits > 0:
+            # compute leftover byte count (ceil)
+            leftover_bytes = (leftover_bits + 7) // 8
+            # take the tail bytes that weren't interpretable as full samples
+            tail_start = len(payload) - leftover_bytes
+            tail = payload[tail_start:].hex()
+            res["residuals"].append(
+                {
+                    "off": id_off + 1 + max(0, tail_start),
+                    "hex": tail,
+                    "n_bytes": leftover_bytes,
+                    "reason": "leftover bits after sample unpack",
+                }
+            )
+
+        if (res["ch256_samples"] + res["ch52_samples"] + res["ch64_samples"]) > 0:
+            res["ok"] = True
+
+    except Exception as e:
+        res["errors"] += 1
+        res["notes"].append(f"exception: {e}")
+        return res
+
+    return res
+
+
+METHODS = {
+    # "method1": decode_muse_method1,
+    # "method2": decode_muse_method2,
+    "method3": decode_muse_method3,
+}
 
 # VALIDATION ====================================================================
 
@@ -671,5 +962,7 @@ if __name__ == "__main__":
             plt.figure(figsize=(12, 8))
             sns.heatmap(pivot)
             plt.title(f"Normalized Score Heatmap – {method}")
-            plt.gca().collections[0].set_clim(rez["score_log"].min(), rez["score_log"].max())
+            plt.gca().collections[0].set_clim(
+                rez["score_log"].min(), rez["score_log"].max()
+            )
             plt.show()

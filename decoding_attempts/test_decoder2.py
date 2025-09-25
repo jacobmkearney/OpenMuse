@@ -1,9 +1,8 @@
-import numpy as np
-import pandas as pd
 import os
-import datetime as dt
 from typing import List, Tuple, Optional, Dict, Any
-import matplotlib.pyplot as plt
+import statistics
+import numpy as np
+import datetime as dt
 
 # --- Prior knowledge ---
 
@@ -106,6 +105,11 @@ BITS_PER_SAMPLE = {
     "CH64": 20,
 }
 
+# Goal for this script is to try various decoding approaches and validate
+# See: https://github.com/AbosaSzakal/MuseAthenaDataformatParser
+
+
+
 
 # ======================================================================
 # Functions ============================================================
@@ -135,52 +139,6 @@ def parse_lines(lines):
         print(f"Warning: Multiple UUIDs found: {set(uuids)}")
 
     return times, uuids, data
-
-
-# Decode ACC+GYR (52Hz) packets ==================================================
-def _decode_ch52_method1(raw_bytes: bytes) -> np.ndarray:
-    """
-    Decode a candidate CH52 raw packet to an array of shape (n_samples, 6)
-    with dtype=int16 and little-endian ordering. Returns an empty (0,6)
-    array when decoding fails or the packet is not CH52-like.
-
-    Based on the patterns of the brute-force method observed in analyze_rawdata.py
-    """
-    # Known CH52 packet headers (kept as a set for fast membership test)
-    CH52_HEADERS = {
-        0xEA,
-        0xED,
-        0xDF,
-        0xE6,
-        0xCB,
-        0xD3,
-        0xDE,
-        0xDB,
-    }
-
-    if len(raw_bytes) < 1:
-        return np.empty((0, 6), dtype=np.int16)
-
-    header = raw_bytes[0]
-    if header not in CH52_HEADERS:
-        return np.empty((0, 6), dtype=np.int16)
-
-    payload = raw_bytes[1:]
-    # Each sample has 6 channels × 2 bytes = 12 bytes
-    bytes_per_sample = 12
-    n = len(payload) // bytes_per_sample
-    if n == 0:
-        return np.empty((0, 6), dtype=np.int16)
-
-    usable = payload[: n * bytes_per_sample]
-    # little-endian int16
-    data = np.frombuffer(usable, dtype="<i2")
-    try:
-        samples = data.reshape(n, 6)
-    except Exception:
-        # In case of unexpected shape, return empty consistent type
-        return np.empty((0, 6), dtype=np.int16)
-    return samples
 
 
 def _sign_extend_12(v: int) -> int:
@@ -217,115 +175,10 @@ def decode_12bit_rows_from_region(sample_region: bytes) -> Optional[np.ndarray]:
     return rows
 
 
-def _decode_ch52_method2(
-    raw_bytes: bytes, pid_offset: int = 9, post_pid_skip: int = 4
-) -> np.ndarray:
-    """
-    Header-agnostic scan for packet-id with (high_nibble==4 and low_nibble==7).
-    pid_offset: preferred fixed pid index to check first (repo uses 9).
-    post_pid_skip: number of bytes to skip after pid before sample region.
-    Returns ndarray shape (n_samples, 6) dtype=int16 or empty array.
-
-    Based on https://github.com/AbosaSzakal/MuseAthenaDataformatParser
-    """
-    if len(raw_bytes) < max(10, pid_offset + 1):
-        return np.empty((0, 6), dtype=np.int16)
-
-    matches = []
-    # Preferred fixed check
-    try:
-        pid = raw_bytes[pid_offset]
-        if (pid >> 4) == 4 and (pid & 0x0F) == 7:
-            matches.append(pid_offset)
-    except Exception:
-        pass
-
-    # Robust scan (but avoid too many false positives by skipping obvious header areas?)
-    for idx, b in enumerate(raw_bytes):
-        if (b >> 4) == 4 and (b & 0x0F) == 7:
-            matches.append(idx)
-
-    # deduplicate (preserve order)
-    seen = set()
-    matches_unique = []
-    for m in matches:
-        if m not in seen:
-            seen.add(m)
-            matches_unique.append(m)
-    if not matches_unique:
-        return np.empty((0, 6), dtype=np.int16)
-
-    all_samples = []
-    for pid_idx in matches_unique:
-        sample_start = pid_idx + 1 + post_pid_skip
-        if sample_start >= len(raw_bytes):
-            continue
-        sample_region = raw_bytes[sample_start:]
-        # Trim region to multiple of 3 bytes
-        sample_region = sample_region[: (len(sample_region) // 3) * 3]
-        if len(sample_region) == 0:
-            continue
-        ints12 = unpack_12bit_le(sample_region)
-        # Trim to multiple of 6 values (6 values per sample row)
-        mvals = (len(ints12) // 6) * 6
-        if mvals == 0:
-            continue
-        ints12 = ints12[:mvals]
-        arr = np.array(ints12, dtype=np.int16).reshape(-1, 6)
-        all_samples.append(arr)
-
-    if not all_samples:
-        return np.empty((0, 6), dtype=np.int16)
-    return np.vstack(all_samples)
-
-
-# Run decoding ============================================================
-def decode_channels(lines: List[str]) -> pd.DataFrame:
-    """
-    Decode lines (from parse_lines) and return a DataFrame with columns:
-    Time, ACCx, ACCy, ACCz, GYRx, GYRy, GYRz
-    Time is unix timestamp (float seconds). Timestamps for multi-sample
-    packets are distributed evenly at CH52 rate, ending at the packet time.
-    """
-    times, uuids, data = parse_lines(lines)
-
-    all_ch52 = []
-    all_times = []
-
-    rate = EXPECTED_RATES["CH52"]
-
-    for t_packet, raw in zip(times, data):
-        ch52 = _decode_ch52_method2(raw)
-        if ch52.size == 0:
-            continue
-
-        n = ch52.shape[0]
-        if n == 1:
-            ts = [t_packet]
-        else:
-            # Place samples evenly in time so that the last sample aligns with t_packet.
-            # Sample interval = 1 / rate. First sample time = t_packet - (n-1)/rate
-            dt_interval = 1.0 / rate
-            start_t = t_packet - (n - 1) * dt_interval
-            ts = list(start_t + np.arange(n) * dt_interval)
-
-        all_ch52.append(ch52)
-        all_times.extend(ts)
-
-    if not all_ch52:
-        cols = ["Time", "GYRx", "GYRy", "GYRz", "ACCx", "ACCy", "ACCz"]
-        return pd.DataFrame(columns=cols)
-
-    stacked = np.vstack(all_ch52)
-    df = pd.DataFrame(stacked, columns=["GYRx", "GYRy", "GYRz", "ACCx", "ACCy", "ACCz"])
-    df.insert(0, "Time", all_times)
-    return df
-
-
 # ======================================================================
 # Debugging ============================================================
 # ======================================================================
-def inspect_packet_simple(
+def inspect_packet(
     raw_bytes: bytes,
     pid_offset: int = 9,
     post_pid_skip: int = 4,
@@ -420,7 +273,7 @@ def inspect_packet_simple(
 
 
 # --- Robust scoring (compact) ---------------------------------------------
-def score_result_simple(rows: Optional[np.ndarray]) -> Dict[str, float]:
+def score_result(rows: Optional[np.ndarray]) -> Dict[str, float]:
     """Simple, bounded scoring to pick best candidate; returns score and key diagnostics."""
     if rows is None or not isinstance(rows, np.ndarray) or rows.size == 0:
         return {
@@ -456,110 +309,92 @@ def score_result_simple(rows: Optional[np.ndarray]) -> Dict[str, float]:
     }
 
 
-# --- Compact grid-runner and summary --------------------------------------
-def debug_file(
-    lines: List[str],
-    n_packets_per_file: int = 3,
+def build_offset_map(
+    data_dir: str = "data_raw",
+    files: List[str] = None,
+    n_packets_per_file: int = 10,
     pid_offsets: List[int] = [8, 9, 10],
     post_pid_skips: List[int] = [3, 4, 5],
-    top_k: int = 3,
-    verbose_inspect: bool = False,
-) -> Dict[int, Dict[str, Any]]:
+    scan_all: bool = False,
+) -> Dict[str, Tuple[int, int]]:
     """
-    Run a small grid per-packet and return summary_per_packet:
-      {packet_index: {"timestamp":..., "best": {...}, "top": [...], "all": [...]}}
-    Also prints short per-packet lines and a per-file aggregate.
+    Grid-run per file and return mapping: filename -> (best_pid_offset, best_post_pid_skip).
+
+    Behavior:
+      - If files is None, iterate sorted filenames in data_dir.
+      - For each file, parse with parse_lines(lines) -> times, uuids, raws.
+      - For first n_packets_per_file packets, run grid (pid_offsets x post_pid_skips).
+      - For each packet choose best candidate by score_result_simple(rows).
+      - Aggregate best choices across packets; pick the most frequent pair.
+      - If tie, choose pair with highest average score across packets where it was best.
     """
-    times, uuids, raws = parse_lines(lines)
-    packets_to_check = min(len(raws), n_packets_per_file)
-    summary_per_packet: Dict[int, Dict[str, Any]] = {}
-    best_counts: Dict[Tuple[int, int], int] = {}
+    mapping: Dict[str, Tuple[int, int]] = {}
+    files_to_check = files if files is not None else sorted(os.listdir(data_dir))
 
-    for i in range(packets_to_check):
-        raw = raws[i]
-        grid_entries = []
-        for po in pid_offsets:
-            for ps in post_pid_skips:
-                rows, meta = inspect_packet_simple(
-                    raw,
-                    pid_offset=po,
-                    post_pid_skip=ps,
-                    scan_all=False,
-                    stats=False,
-                    verbose=verbose_inspect,
-                )
-                metrics = score_result_simple(rows)
-                grid_entries.append(
-                    {
-                        "pid": int(po),
-                        "pskip": int(ps),
-                        "score": metrics["score"],
-                        "rows": int(metrics["rows"]),
-                        "accel_mean_abs": metrics["accel_mean_abs"],
-                        "gyro_mean_abs": metrics["gyro_mean_abs"],
-                        "acc_mag_std": metrics["acc_mag_std"],
-                    }
-                )
-
-        # sort and pick top candidates
-        grid_entries.sort(key=lambda e: e["score"], reverse=True)
-        best = grid_entries[0]
-        top = grid_entries[:top_k]
-        key = (best["pid"], best["pskip"])
-        best_counts[key] = best_counts.get(key, 0) + 1
-
-        summary_per_packet[i] = {
-            "timestamp": times[i],
-            "best": best,
-            "top": top,
-            "all": grid_entries,
-        }
-
-        # concise print
-        print(
-            f"Pkt {i} @ {times[i]}  BEST pid={best['pid']} pskip={best['pskip']} score={best['score']:.2f} rows={best['rows']} accel={best['accel_mean_abs']:.1f}"
-        )
-
-    # per-file aggregate
-    if best_counts:
-        sorted_counts = sorted(best_counts.items(), key=lambda kv: kv[1], reverse=True)
-        (pid_m, ps_m), cnt = sorted_counts[0]
-        stability = cnt / max(1, packets_to_check)
-        print(
-            f"\nMost common best: pid={pid_m} pskip={ps_m} (count={cnt}/{packets_to_check}) stability={stability:.2f}"
-        )
-        for (pid_, pskip_), c in sorted_counts:
-            print(f"  ({pid_},{pskip_}) -> {c}")
-    return summary_per_packet
-
-
-# ======================================================================
-# Main =================================================================
-# ======================================================================
-if __name__ == "__main__":
-    all_results = []
-    for fname in os.listdir("data_raw"):
-        # fname = "data_p1034.txt"
-        with open(os.path.join("data_raw", fname), "r", encoding="utf-8") as f:
+    for fname in files_to_check:
+        fpath = os.path.join(data_dir, fname)
+        if not os.path.isfile(fpath):
+            continue
+        with open(fpath, "r", encoding="utf-8") as f:
             lines = f.readlines()
-        print(f"\n=== file: {fname} ({len(lines)} lines) ===")
-        debug_file(lines)
-        df = decode_channels(lines)
-        # df.plot(
-        #     x="Time", y=["ACCx", "ACCy", "ACCz", "GYRx", "GYRy", "GYRz"], subplots=True
-        # )
-        df["Preset"] = fname.replace("data_", "").replace(".txt", "")
-        all_results.append(df)
+        times, uuids, raws = parse_lines(lines)
+        pkt_count = min(len(raws), n_packets_per_file)
+        if pkt_count == 0:
+            continue
 
-    combined = pd.concat(all_results, ignore_index=True)
+        # Track how many times each pair was selected and accumulate scores for tie-breaking
+        freq: Dict[Tuple[int, int], int] = {}
+        scores_for_pair: Dict[Tuple[int, int], List[float]] = {}
 
-    # Visualize results
-    fig, axes = plt.subplots(nrows=4, ncols=4, figsize=(15, 10))
-    for (preset, group), ax in zip(combined.groupby("Preset"), axes.flatten()):
-        group.plot(
-            x="Time",
-            y=["ACCx", "ACCy", "ACCz", "GYRx", "GYRy", "GYRz"],
-            title=preset,
-            ax=ax,
-            alpha=0.7,
+        for i in range(pkt_count):
+            raw = raws[i]
+            # evaluate grid for this packet and collect all candidate scores
+            candidates: List[Dict[str, Any]] = []
+            for po in pid_offsets:
+                for ps in post_pid_skips:
+                    rows, meta = inspect_packet(
+                        raw,
+                        pid_offset=po,
+                        post_pid_skip=ps,
+                        scan_all=scan_all,
+                        stats=False,
+                        verbose=False,
+                    )
+                    metrics = score_result(rows)
+                    candidates.append(
+                        {
+                            "pid": int(po),
+                            "pskip": int(ps),
+                            "score": float(metrics["score"]),
+                        }
+                    )
+            # pick best candidate for this packet
+            candidates.sort(key=lambda e: e["score"], reverse=True)
+            best = candidates[0]
+            key = (best["pid"], best["pskip"])
+            freq[key] = freq.get(key, 0) + 1
+            scores_for_pair.setdefault(key, []).append(best["score"])
+
+        # choose most frequent pair; break ties by average score
+        if not freq:
+            continue
+        # sort pairs by (frequency desc, avg_score desc)
+        pairs = list(freq.items())  # [(pair, count), ...]
+        pairs.sort(
+            key=lambda kv: (kv[1], statistics.mean(scores_for_pair[kv[0]])),
+            reverse=True,
         )
+        best_pair = pairs[0][0]  # (pid_offset, pskip)
+        mapping[fname] = best_pair
+
+    return mapping
+
+
+# ======================================================================
+# Main ==========================================================================
+# ======================================================================
+
+mapping = build_offset_map(data_dir="data_raw", n_packets_per_file=10)
+print("Per-file mapping:")
+for fname, (pid, pskip) in mapping.items():
+    print(f"  {fname}: pid_offset={pid}, post_pid_skip={pskip}")

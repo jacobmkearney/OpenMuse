@@ -14,6 +14,9 @@ Key Ideas:
 - If a header appears N times per second, then to deliver a known sampling rate R,
   each packet must carry roughly R/N samples.
 - For CH256, CH52, CH64, this tends to yield integers near 12, 6, 2 respectively.
+
+Note:
+- The packets are not fixed in any way, they contain a random assortment of subpackets, so it might be difficult to further figure out what they contain just with raw pattern analysis.
 """
 
 import os
@@ -585,6 +588,8 @@ def analyze_file(path: str) -> pd.DataFrame:
         row = {
             "Header": f"0x{hdr:02x}",
             "HdrByte": hdr,  # raw integer header for joins/diagnostics
+            "HighNibble": (hdr >> 4) & 0xF,
+            "LowNibble": hdr & 0xF,
             "Packets": len(info["times"]),
             "PktHzRaw": pkt_hz_raw,
             "PktHzSeqHint": seq_hint if seq_hint is not None else np.nan,
@@ -594,9 +599,8 @@ def analyze_file(path: str) -> pd.DataFrame:
             "BlocksPerPkt": None,
             "ObsHz": None,
             "RelErr": None,
-            "Note": None,
-            # NEW: sequence purity for this header (0..1)
             "SequencePurity": per_hdr_purity.get(hdr, 0.0),
+            "Note": None,
         }
         if res:
             row.update(
@@ -746,6 +750,18 @@ if __name__ == "__main__":
                 BlocksPerPkt_SD=("BlocksPerPkt", "std"),
                 ObsHz_Median=("ObsHz", "median"),
                 ObsHz_SD=("ObsHz", "std"),
+                HighNibble_Mode=(
+                    "HighNibble",
+                    lambda s: int(s.mode().iloc[0]) if not s.mode().empty else np.nan,
+                ),
+                LowNibble_Mode=(
+                    "LowNibble",
+                    lambda s: int(s.mode().iloc[0]) if not s.mode().empty else np.nan,
+                ),
+                HighNibble_UniqueCount=(
+                    "HighNibble",
+                    lambda s: int(s.dropna().nunique()),
+                ),
                 RelErr_Median=("RelErr", "median"),
                 SequencePurity_Median=("SequencePurity", "median"),
             )
@@ -754,8 +770,15 @@ if __name__ == "__main__":
         print("\n=== Header Summary ===")
         print(summary.to_markdown(floatfmt=(".2f")))
 
+        # Notes:
+        # - HighNibble_Mode quickly validates the repo assertion that high nibble encodes frequency (expect modes 0x1,0x3,0x4 for 256/64/52 Hz).
+        # - LowNibble_Mode shows the dominant data-type encoding (EEG/OPTICS/IMU variants).
+        # - HighNibble_UniqueCount > 1 indicates potential capture issues, spoofed packets, multiplexing, or file-to-file differences — these should be triaged first.
+        # - Use HighNibble_Mode together with ObsHz_Median to detect misclassifications: if HighNibble_Mode suggests 0x1 (256Hz) but ObsHz_Median ≈ 64, you likely have mixed payloads or wrong overhead assumptions.
+
         # Summary
         summary_table = build_decoder_summary(combined)
+        print(summary_table.to_markdown(floatfmt=(".2f")))
         print(summary_table.to_string(index=False))
 
         presence_matrix = build_header_summary(combined)
@@ -766,3 +789,4 @@ if __name__ == "__main__":
         fig = plot_header_histograms(all_results)
         fig.show()
         fig.savefig("header_histograms.png", dpi=150)
+
