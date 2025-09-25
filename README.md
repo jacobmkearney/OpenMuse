@@ -4,6 +4,7 @@ Minimal utilities to discover and stream Muse EEG devices via Bluetooth LE.
 
 > [!CAUTION]
 > **STATUS: FAILED**
+> 
 > This is my attempt at enabling LSL streaming for the Muse S Athena. But I have not been able to decode the data packets properly. Please get in touch if you can help.
 
 ## Install
