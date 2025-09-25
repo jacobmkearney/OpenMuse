@@ -4,7 +4,7 @@ import re
 import os
 import time
 from datetime import datetime, timezone
-from typing import Iterable, Optional
+from typing import Iterable, LiteralString, Optional
 
 import bleak
 
@@ -47,7 +47,7 @@ async def _record_async(
 
     notified = 0
     stream_started = asyncio.Event()
-    device_info_logged = {"fw": False, "bp": False, "text": False}
+    device_info_logged = False
     control_buffer = ""
 
     def _ts() -> str:
@@ -88,7 +88,7 @@ async def _record_async(
             if verbose:
                 print("Connected. Subscribing and configuring ...")
 
-            # Optionally subscribe to control notifications (best-effort)
+            # Subscribe to control notifications
             try:
 
                 def _on_control(_, data: bytearray):
@@ -98,60 +98,34 @@ async def _record_async(
                     except Exception:
                         return
 
-                    nonlocal control_buffer
+                    nonlocal control_buffer, device_info_logged
                     # Accumulate to handle fragmented JSON across notifications
                     control_buffer = (control_buffer + text)[-4096:]
 
-                    # Attempt JSON parse first (preferred)
-                    try:
-                        if "{" in control_buffer and "}" in control_buffer:
-                            start = control_buffer.index("{")
-                            end = control_buffer.rindex("}") + 1
-                            payload = control_buffer[start:end]
-                            info = json.loads(payload)
-                            if verbose:
-                                if not device_info_logged["fw"] and "fw" in info:
-                                    print(f"Firmware: {info['fw']}")
-                                    device_info_logged["fw"] = True
-                                if not device_info_logged["bp"] and "bp" in info:
-                                    bp_val = info["bp"]
-                                    try:
-                                        bp_int = int(bp_val)
-                                        print(f"Battery: {bp_int}%")
-                                    except Exception:
-                                        print(f"Battery: {bp_val}%")
-                                    device_info_logged["bp"] = True
-                    except Exception:
-                        pass
-
-                    # Heuristics in plain text if JSON not present/parsed
-                    if verbose:
-                        if not device_info_logged["bp"]:
-                            m = re.search(
-                                r"(bp|battery|batt|charge)[^0-9]{0,10}(\d{1,3})",
-                                text,
-                                re.I,
-                            )
-                            if m:
-                                val = int(m.group(2))
-                                if 0 <= val <= 100:
-                                    print(f"Battery: {val}%")
-                                    device_info_logged["bp"] = True
-                        if not device_info_logged["fw"] and re.search(
-                            r"\bfw\b", text, re.I
+                    # Attempt JSON parse
+                    if not device_info_logged:
+                        # Try locating in string 'sp', 'fw', and 'bp'
+                        info = {
+                            "device": re.search(
+                                r'"sp"\s*:\s*"([^"]+)"', control_buffer
+                            ),
+                            "firmware": re.search(
+                                r'"fw"\s*:\s*"([^"]+)"', control_buffer
+                            ),
+                            "battery": re.search(
+                                r'"bp"\s*:\s*([\d.]+)', control_buffer
+                            ),
+                        }
+                        # BUG: for some reason info["device"] is always None as if it was undetected.
+                        if (
+                            # info["device"] is not None and
+                            info["firmware"] is not None
+                            and info["battery"] is not None
                         ):
-                            mfw = re.search(
-                                r"\bfw\b\s*[:=\-]?\s*\"?([\w\.-]+)\"?", text, re.I
+                            print(
+                                f"Connected to device (firmware {info['firmware'].group(1)}): battery {info['battery'].group(1)}%"
                             )
-                            if mfw:
-                                print(f"Firmware: {mfw.group(1)}")
-                                device_info_logged["fw"] = True
-                        # Fallback: print first control text once to aid debugging
-                        if not device_info_logged["text"]:
-                            snippet = text.strip().replace("\n", " ")
-                            if snippet:
-                                print(f"Control: {snippet[:120]}")
-                                device_info_logged["text"] = True
+                            device_info_logged = True
 
                 await client.start_notify(CONTROL_CHAR_UUID, _on_control)
                 if verbose:

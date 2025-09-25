@@ -22,6 +22,11 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 from functools import reduce
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib import cm
+from pathlib import Path
+from typing import Sequence
 
 # --- Prior knowledge ---
 
@@ -37,9 +42,10 @@ from functools import reduce
 # - fNIRS Sensor: 5-optode bilateral frontal cortex hemodynamics, 64 Hz sample rate, 20-bit resolution
 #   - Might result in 1, 4, 5, 8, 16 OPTICS channels
 
-# Different presets may enable/disable some channels.
-
-# Note: 1034 is the only preset for which a red LED brightly turned on during recording, suggesting the activation of OPTICS or PPG channels.
+# Different presets enable/disable some channels, but the exact combinations are not fully documented.
+# - p20-p61: Red LED in the centre is off
+# - p1034, p1041, p1042, p1043: red LED in the centre is brightly on (suggesting the activation of OPTICS or PPG channels)
+# - p1035, p1044, p1045, p4129: red LED in the centre is dimmer
 
 # Based on these specs, we can derive the following plausible expectations regarding each channel type:
 
@@ -492,12 +498,53 @@ def analyze_file(path: str) -> pd.DataFrame:
     ordered_headers = [p[0] for p in data if p]
     period, purity, profiles = detect_header_cycle(ordered_headers, max_period=16)
 
+    # --- derive per-header sequence purity ---
+    # Try sequence_groups first (expects profiles from detect_header_cycle)
+    per_hdr_purity = {}
+    if profiles:
+        # sequence_groups expects profiles and returns hdr -> {'positions': [...], 'support': x}
+        try:
+            seq_map = sequence_groups(profiles, period, min_share=0.01)
+        except Exception:
+            seq_map = {}
+
+        if seq_map:
+            # keys in seq_map are header bytes (ints)
+            for h, entry in seq_map.items():
+                per_hdr_purity[h] = float(entry.get("support", 0.0))
+        else:
+            # fallback: compute purity from raw profiles: top-position fraction
+            import collections
+
+            hdr_counts = collections.defaultdict(int)
+            hdr_top = collections.defaultdict(int)
+            for pos_prof in profiles:
+                for h, c in pos_prof.items():
+                    hdr_counts[h] += c
+                    if c > hdr_top[h]:
+                        hdr_top[h] = c
+            for h in hdr_counts:
+                per_hdr_purity[h] = (
+                    float(hdr_top[h]) / float(hdr_counts[h]) if hdr_counts[h] else 0.0
+                )
+    # if no profiles, per_hdr_purity remains empty and we default to 0.0 below
+
     by_hdr = defaultdict(lambda: {"times": [], "payloads": []})
     for t, p in zip(times, data):
         if not p:
             continue
         by_hdr[p[0]]["times"].append(t)
         by_hdr[p[0]]["payloads"].append(p)
+
+    # small helper for safe float formatting
+    import math
+
+    def fmt_opt(x, fmt="{:.3f}"):
+        return (
+            fmt.format(x)
+            if (x is not None and not (isinstance(x, float) and math.isnan(x)))
+            else "None"
+        )
 
     rows = []
     for hdr, info in by_hdr.items():
@@ -506,7 +553,7 @@ def analyze_file(path: str) -> pd.DataFrame:
 
         # Sequence-derived hint (if cycle strong)
         seq_hint = None
-        if period and purity >= 0.7:
+        if (period is not None) and (purity is not None) and (purity >= 0.7):
             seq_hint = sequence_rate_hint(info["times"], period, ordered_headers, hdr)
 
         # Blend for stability when we have a hint
@@ -523,17 +570,18 @@ def analyze_file(path: str) -> pd.DataFrame:
             overhead_fn=estimate_overhead_bytes,
             note_tags=[
                 f"hdr=0x{hdr:02x}",
-                f"period={period}" if period else "period=None",
-                f"purity={purity:.3f}",
-                f"seq_hint={seq_hint:.3f}" if seq_hint else "seq_hint=None",
+                f"period={period}" if period is not None else "period=None",
+                f"purity={purity:.3f}" if purity is not None else "purity=None",
+                f"seq_hint={fmt_opt(seq_hint)}",
                 f"pkt_hz_raw={pkt_hz_raw:.3f}",
                 f"pkt_hz_blend={pkt_hz_blend:.3f}",
             ],
-            pkt_hz_hint=pkt_hz_blend,  # <= NEW: use blended rate
+            pkt_hz_hint=pkt_hz_blend,  # <= use blended rate
         )
 
         row = {
             "Header": f"0x{hdr:02x}",
+            "HdrByte": hdr,  # raw integer header for joins/diagnostics
             "Packets": len(info["times"]),
             "PktHzRaw": pkt_hz_raw,
             "PktHzSeqHint": seq_hint if seq_hint is not None else np.nan,
@@ -544,6 +592,8 @@ def analyze_file(path: str) -> pd.DataFrame:
             "ObsHz": None,
             "RelErr": None,
             "Note": None,
+            # NEW: sequence purity for this header (0..1)
+            "SequencePurity": per_hdr_purity.get(hdr, 0.0),
         }
         if res:
             row.update(
@@ -560,7 +610,7 @@ def analyze_file(path: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# Summary functions ================================================================
+# Diagnostic functions ================================================================
 def build_decoder_summary(df_all: pd.DataFrame) -> pd.DataFrame:
     # Keep only rows with some classification
     df_valid = df_all.dropna(subset=["BestCH"])
@@ -602,6 +652,71 @@ def build_header_summary(combined: pd.DataFrame) -> pd.DataFrame:
     return type_map
 
 
+def plot_header_histograms(
+    dfs: Sequence[pd.DataFrame],
+    *,
+    file_col: str = "File",
+    header_col: str = "Header",
+    count_col: str = "Packets",
+    figsize=(4, 3),
+    cmap_name="tab10",
+):
+    pairs = []
+    for df in dfs:
+        if file_col not in df.columns:
+            raise ValueError(f"Missing column '{file_col}'")
+        fname = df[file_col].iloc[0]
+        pairs.append((fname, df.copy()))
+
+    if not pairs:
+        raise ValueError("No dataframes provided.")
+
+    all_headers = sorted(
+        {h for _, df in pairs for h in df[header_col].dropna().unique()},
+        key=lambda s: int(s, 16) if isinstance(s, str) and s.startswith("0x") else s,
+    )
+
+    n_files = len(pairs)
+    ncols = 3
+    nrows = int(np.ceil(n_files / ncols))
+    fig_width = figsize[0] * ncols
+    fig_height = figsize[1] * nrows
+    fig, axes = plt.subplots(nrows, ncols, figsize=(fig_width, fig_height))
+    axes = axes.flatten()
+
+    cmap = cm.get_cmap(cmap_name, n_files)
+
+    for i, (fname, df) in enumerate(pairs):
+        ax = axes[i]
+        counts = {h: 0 for h in all_headers}
+        for _, row in df.iterrows():
+            h = row[header_col]
+            c = int(row.get(count_col, 1) or 0)
+            if h in counts:
+                counts[h] += c
+        total = sum(counts.values()) or 1
+        proportions = [counts[h] / total for h in all_headers]
+
+        x = np.arange(len(all_headers))
+        ax.bar(x, proportions, color=cmap(i), edgecolor="k", alpha=0.9)
+        ax.set_xticks(x)
+        ax.set_xticklabels(all_headers, rotation=90, fontsize=8)
+        ax.set_ylim(0, max(0.1, max(proportions) * 1.15))
+        ax.set_title(Path(fname).name, fontsize=10)
+        ax.set_ylabel("Proportion")
+
+        for xi, p in zip(x, proportions):
+            if p > 0.02:
+                ax.text(xi, p + 0.005, f"{p:.2f}", ha="center", va="bottom", fontsize=7)
+
+    # Hide unused subplots
+    for j in range(n_files, len(axes)):
+        fig.delaxes(axes[j])
+
+    plt.tight_layout()
+    return fig
+
+
 # Main execution ==================================================================
 if __name__ == "__main__":
     all_results = []
@@ -619,20 +734,22 @@ if __name__ == "__main__":
         summary = (
             combined.groupby("Header")
             .agg(
-                {
-                    "BestCH": lambda x: (
-                        x.mode()[0] if not x.mode().empty else "uncertain"
-                    ),
-                    "BlocksPerPkt": "median",
-                    "ObsHz": "median",
-                    "RelErr": "median",
-                    "File": "count",
-                }
+                FileCount=("File", "count"),
+                BestGuessCH=(
+                    "BestCH",
+                    lambda x: x.mode()[0] if not x.mode().empty else "uncertain",
+                ),
+                BlocksPerPkt_Median=("BlocksPerPkt", "median"),
+                BlocksPerPkt_SD=("BlocksPerPkt", "std"),
+                ObsHz_Median=("ObsHz", "median"),
+                ObsHz_SD=("ObsHz", "std"),
+                RelErr_Median=("RelErr", "median"),
+                SequencePurity_Median=("SequencePurity", "median"),
             )
-            .rename(columns={"File": "FileCount"})
+            .sort_values(by="ObsHz_Median", ascending=False)
         )
-        print("\n=== Consistency across files ===")
-        print(summary.to_string(float_format=lambda x: f"{x:.2f}"))
+        print("\n=== Header Summary ===")
+        print(summary.to_markdown(floatfmt=(".2f")))
 
         # Summary
         summary_table = build_decoder_summary(combined)
@@ -641,3 +758,8 @@ if __name__ == "__main__":
         presence_matrix = build_header_summary(combined)
         print("\n=== Header presence across presets ===")
         print(presence_matrix.to_string())
+
+        # Plot
+        fig = plot_header_histograms(all_results)
+        fig.show()
+        fig.savefig("header_histograms.png", dpi=150)
