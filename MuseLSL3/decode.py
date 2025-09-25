@@ -4,80 +4,110 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+# Constants ----------------------------
+# GYRO/ACC settings
 
-def extract_time(payload: bytes) -> Optional[datetime]:
+GYRO_FS = 52.0
+GYRO_DT = 1.0 / GYRO_FS
+GYRO_TAG = 0x47
+GYRO_HEADER_LEN = 1 + 4
+GYRO_BLOCK_BYTES = 18 * 2
+GYRO_MIN_BLOCK_LEN = GYRO_HEADER_LEN + GYRO_BLOCK_BYTES
+# -------------------------------------
+
+
+def extract_time(payload: bytes):
     """
-    Extract packet time from a single payload and return a UTC datetime. 4-byte unsigned little-endian at offset 3 -> milliseconds.
+    Extract packet time from a single payload. 4-byte unsigned little-endian at offset 3 -> milliseconds.
     """
     # primary 4-byte little-endian at offset 3
     if len(payload) >= 3 + 4:
         ms = struct.unpack_from("<I", payload, 3)[0]
-        return ms * 1e-3
+        return ms * 1e-3  # convert to seconds
 
     return None
 
 
-def extract_gyroacc(payload: bytes, time_prev, time_current):
+def extract_gyroacc(payload: bytes, time_prev: Optional[float], time_current: float):
     """
-    Parse all 0x47 ACC/GYRO blocks in payload and return two arrays:
-      - acc: shape (N, 3) floats in g (columns acc_x, acc_y, acc_z)
-      - gyro: shape (N, 3) floats in dps (columns gyro_x, gyro_y, gyro_z)
+    Yield per-sample tuples:
+      (time_s, acc_x_g, acc_y_g, acc_z_g, gyro_x_dps, gyro_y_dps, gyro_z_dps)
 
-    Each 0x47 block contains 18 int16 values = 3 samples * 6 channels.
-    Samples are returned in chronological order (within-block order preserved).
-    If no blocks found, returns two empty arrays with shape (0, 3).
+    time_prev and time_current are seconds; last sample equals time_current.
+    If time_prev is None the function uses GYRO_DT_S spacing to align the block.
+    Minimal allocations: unpacks each block once and yields floats per sample.
     """
-    TAG = 0x47
-    HEADER_LEN = 1 + 4
-    BLOCK_BYTES = 18 * 2
-    MIN_BLOCK_LEN = HEADER_LEN + BLOCK_BYTES
-    SAMPLE_RATE = 52.0
-
-    acc_blocks = []
-    gyro_blocks = []
-    start = 0
     plen = len(payload)
+    start = 0
 
-    while start + MIN_BLOCK_LEN <= plen:
-        idx = payload.find(bytes([TAG]), start)
+    blocks = []
+    while start + GYRO_MIN_BLOCK_LEN <= plen:
+        idx = payload.find(bytes([GYRO_TAG]), start)
         if idx == -1:
             break
-        if idx + MIN_BLOCK_LEN > plen:
+        if idx + GYRO_MIN_BLOCK_LEN > plen:
             break
-        block_start = idx + HEADER_LEN
+        block_start = idx + GYRO_HEADER_LEN
         try:
             raw = struct.unpack_from("<18h", payload, block_start)
         except struct.error:
             start = idx + 1
             continue
-        vals = np.array(raw, dtype=np.int16).reshape((3, 6)).astype(np.float32)
-        acc_block = vals[:, 0:3] / 16384.0
-        gyro_block = vals[:, 3:6] / 131.0
-        acc_blocks.append(acc_block)
-        gyro_blocks.append(gyro_block)
-        start = block_start + BLOCK_BYTES
+        blocks.append(raw)
+        start = block_start + GYRO_BLOCK_BYTES
 
-    if not acc_blocks:
-        return (np.empty((0, 4), dtype=np.float32), np.empty((0, 4), dtype=np.float32))
+    if not blocks:
+        return
 
-    acc = np.vstack(acc_blocks)  # (total_samples, 3)
-    gyro = np.vstack(gyro_blocks)  # (total_samples, 3)
-    total_samples = acc.shape[0]
+    total_samples = len(blocks) * 3
 
-    # compute uniform per-sample spacing (ms)
-    if time_prev is not None:
-        dt_ms = (time_current - time_prev) / float(total_samples)
-        # t = time_prev + dt_ms * [1, 2, ..., total_samples] so last == time_current
-        t = time_prev + dt_ms * np.arange(1, total_samples + 1)
-    else:
-        dt_ms = 1000.0 / SAMPLE_RATE
-        # align last sample to time_current
-        t = time_current - dt_ms * (np.arange(total_samples - 1, -1, -1))
-        t = t[::-1]  # ascending order
+    if time_prev is None:
+        time_prev = time_current - total_samples * GYRO_DT
 
-    # prepend time column
-    acc = np.hstack((t.reshape(-1, 1), acc.astype(np.float32)))
-    gyro = np.hstack((t.reshape(-1, 1), gyro.astype(np.float32)))
+    dt_s_uniform = (time_current - time_prev) / float(total_samples)
+
+    sample_index = 0
+    for raw_block in blocks:
+        for s in range(3):
+            base = s * 6
+            acc_x = raw_block[base + 0] / 16384.0
+            acc_y = raw_block[base + 1] / 16384.0
+            acc_z = raw_block[base + 2] / 16384.0
+            gyro_x = raw_block[base + 3] / 131.0
+            gyro_y = raw_block[base + 4] / 131.0
+            gyro_z = raw_block[base + 5] / 131.0
+
+            t_s = time_prev + (sample_index + 1) * dt_s_uniform
+            yield (t_s, acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z)
+            sample_index += 1
+
+
+# Convenience: collect into NumPy arrays in one allocation
+def stream_to_arrays(it):
+    """
+    Consume the stream and return (times_s, acc_with_t, gyro_with_t)
+
+    - acc: shape (N,4) float32 columns = [time_s, acc_x, acc_y, acc_z]
+    - gyro: shape (N,4) float32 columns = [time_s, gyro_x, gyro_y, gyro_z]
+    """
+    rows = list(it)
+    if not rows:
+        return (
+            np.empty((0, 4), dtype=np.float32),
+            np.empty((0, 4), dtype=np.float32),
+        )
+    arr = np.array(
+        rows, dtype=np.float64
+    )  # shape (N,7): time, acc_x..acc_z, gyro_x..gyro_z
+    times = arr[:, 0].astype(np.float64)  # (N,)
+
+    acc = arr[:, 1:4].astype(np.float32)  # (N,3)
+    gyro = arr[:, 4:7].astype(np.float32)  # (N,3)
+
+    # prepend time column (cast times to float32 to keep arrays compact)
+    ts = times.astype(np.float32).reshape(-1, 1)  # (N,1)
+    acc = np.hstack((ts, acc))  # (N,4)
+    gyro = np.hstack((ts, gyro))  # (N,4)
 
     return acc, gyro
 
@@ -100,16 +130,30 @@ def decode_rawdata(lines: list[str]):
         except Exception:
             continue
 
-    d_gyro = []
-    d_acc = []
-    t_current, t_prev = None, None
+    acc_chunks = []
+    gyro_chunks = []
+    t_prev = None
+
     for pkt in data:
         t_current = extract_time(pkt)
-        acc, gyro = extract_gyroacc(pkt, t_prev, t_current)
-        d_acc.append(acc)
-        d_gyro.append(gyro)
+
+        it = extract_gyroacc(pkt, t_prev, t_current)
+        acc, gyro = stream_to_arrays(it)
+        # acc, gyro = extract_gyroacc(pkt, t_prev, t_current)
+        if acc.size:
+            acc_chunks.append(acc)
+            gyro_chunks.append(gyro)
         t_prev = t_current
 
-    df_acc = pd.DataFrame(np.vstack(d_acc), columns=["time", "ACC_X", "ACC_Y", "ACC_Z"])
+    df_acc = pd.DataFrame(
+        np.vstack(acc_chunks), columns=["time", "ACC_X", "ACC_Y", "ACC_Z"]
+    )
+    df_gyro = pd.DataFrame(
+        np.vstack(gyro_chunks), columns=["time", "GYRO_X", "GYRO_Y", "GYRO_Z"]
+    )
 
-    return times
+    return times, df_acc, df_gyro
+
+
+# df_acc.plot(x="time", y=["ACC_X", "ACC_Y", "ACC_Z"])
+# df_gyro.plot(x="time", y=["GYRO_X", "GYRO_Y", "GYRO_Z"])
