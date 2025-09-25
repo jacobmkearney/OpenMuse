@@ -53,7 +53,7 @@ KNOWN_CHANNELS = {
 
 # --- Expectations ---
 
-
+# These are different possible channel numbers for each group that might show up in various presets.
 EXPECTED_GROUPS = {
     "CH256": list(
         set(
@@ -1233,7 +1233,7 @@ def characterise_and_validate_file(
 files = os.listdir("./data_raw/")
 signals = {}
 for f in files:
-    f = "data_p1045.txt"  # for quick testing
+    # f = "data_p1045.txt"  # for quick testing
     filename = os.path.join("./data_raw/", f)
     print(f"Processing {filename}...")
     preset = f.replace("data_", "").replace(".txt", "")
