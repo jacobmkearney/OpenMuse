@@ -50,12 +50,10 @@ MuseLSL3 record --address 00:55:DA:B9:FA:20 --timeout 60 --outfile data_raw/data
 ```
 
 
-- p20-p61: no red light
-- p1034, p1041, p1042, p1043: red light in the centre is brightly on
-- p1035, p1044, p1045, p4129: red light in the centre is turned on but dimmer 
 
+## Decoding
 
-## Decoding Information
+### Constructor Information
 
 Muse S Athena specs (From the [Muse website](https://eu.choosemuse.com/products/muse-s-athena) - note that these info might not be up to date or fully accurate):
 - Wireless Connection: BLE 5.3, 2.4 GHz
@@ -68,10 +66,14 @@ Muse S Athena specs (From the [Muse website](https://eu.choosemuse.com/products/
 - fNIRS Sensor: 5-optode bilateral frontal cortex hemodynamics, 64 Hz sample rate, 20-bit resolution
   - Might result in 1, 4, 5, 8, 16 OPTICS channels
 
+### Presets
+
 Different presets enable/disable some channels, but the exact combinations are not fully documented.
 - p20-p61: Red LED in the centre is off
 - p1034, p1041, p1042, p1043: red LED in the centre is brightly on (suggesting the activation of OPTICS or PPG channels)
 - p1035, p1044, p1045, p4129: red LED in the centre is dimmer
+
+### Attempt 
 
 I have attempted to decode the raw data files recorded with different presets in [`decoding_attempts/analyze_rawdata.py`](decoding_attempts/analyze_rawdata.py).
 
@@ -115,7 +117,7 @@ I have attempted to decode the raw data files recorded with different presets in
 | 0xdb     |          15 | CH52          |                  6.00 |              8.21 |          50.05 |      71.86 |            0.04 |                    0.12 |
 | 0xe9     |           1 | uncertain     |                nan    |            nan    |         nan    |     nan    |          nan    |                    1.00 |
 
-![](decoding_attempts/header_histogram.png)
+![](decoding_attempts/header_histograms.png)
 
 ## Related Projects
 

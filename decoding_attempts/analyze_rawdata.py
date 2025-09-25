@@ -30,6 +30,7 @@ from typing import Sequence
 
 # --- Prior knowledge ---
 
+### Constructor Information
 
 # Muse S Athena specs (From the [Muse website](https://eu.choosemuse.com/products/muse-s-athena) - note that these info might not be up to date or fully accurate):
 # - Wireless Connection: BLE 5.3, 2.4 GHz
@@ -41,6 +42,8 @@ from typing import Sequence
 # - PPG Sensor: Triple wavelength: IR (850nm), Near-IR (730nm), Red (660nm), 64 Hz sample rate, 20-bit resolution
 # - fNIRS Sensor: 5-optode bilateral frontal cortex hemodynamics, 64 Hz sample rate, 20-bit resolution
 #   - Might result in 1, 4, 5, 8, 16 OPTICS channels
+
+### Presets
 
 # Different presets enable/disable some channels, but the exact combinations are not fully documented.
 # - p20-p61: Red LED in the centre is off
