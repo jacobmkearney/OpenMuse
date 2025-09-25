@@ -165,7 +165,7 @@ BITS_PER_SAMPLE = {
 # 3. Payload structure: id byte for DATA TYPE
 # Extract the the number and rate of the DATA TYPE identifiers in the id bytes
 # Test: The rate of channel types should be consistent with the expected rates of the channel types and the possible number of channels
-# STATUS: NOT DONE YET
+# STATUS: Results confirmed previous findings: 10th byte consistent with type info
 
 
 # ======================================================================
@@ -195,29 +195,11 @@ def _parse_lines(lines):
     return times, uuids, data, errors / len(lines)
 
 
-# Analyze the packet id bytes -------------------------------------------
-def _extract_freq_ids(data, location=12):
-    """Extract frequency identifiers (upper 4 bits of the id byte) from each payload."""
-    freq_ids = []
-    errors = 0
-    for payload in data:
-        if (
-            len(payload) < location
-        ):  # need at least 'location' bytes to access the id byte
-            errors += 1
-            continue  # malformed or too short
-        id_byte = payload[location - 1]  # 'location'th byte (0-indexed)
-        freq_code = (id_byte >> 4) & 0x0F
-        freq_ids.append(freq_code)
-    return freq_ids, errors / len(data)
+def assess_id_bytes(data, location=12):
+    """Analyse ID byte (at given location) containing freq (upper nibble) and type (lower nibble)."""
 
-
-def assess_freq_ids(data, location=12):
-    freq_ids, err_rate = _extract_freq_ids(data, location=location)
-    counts = pd.Series(freq_ids).value_counts().sort_index()
-
-    # Map frequency codes to Hz (from spec)
-    freq_map = {
+    # Maps ---------------------------------------------------------------
+    FREQ_MAP = {
         1: 256.0,
         2: 128.0,
         3: 64.0,
@@ -229,43 +211,7 @@ def assess_freq_ids(data, location=12):
         9: 0.1,
     }
 
-    counts = pd.DataFrame(counts)
-    counts["freq"] = counts.index.map(freq_map)
-
-    # How many codes detected are unexpected (i.e., not in freq_map)
-    unexpected = counts[counts["freq"].isna()]["count"].sum() / counts["count"].sum()
-
-    # Spearman correlation between count and freq
-    corr = counts["count"].corr(counts["freq"], method="spearman")
-
-    result = {
-        "FreqLoc": location,
-        "FreqParseErrors": err_rate,
-        "FreqUnnexpected": unexpected,
-        "FreqExpectedPattern": 1 - np.abs(corr),
-    }
-
-    if len(counts) <= 2:
-        result["FreqExpectedPattern"] = 1.0  # not enough data to assess pattern
-    return result
-
-
-def _extract_type_ids(data, location=12):
-    data_ids = []
-    errors = 0
-    for payload in data:
-        if len(payload) < location:
-            errors += 1
-            continue
-        id_byte = payload[location - 1]
-        dtype_code = id_byte & 0x0F
-        data_ids.append(dtype_code)
-    return data_ids, errors / len(data)
-
-
-def assess_types_ids(data, location=12):
     DATA_TYPE_MAP = {
-        # 0: "Invalid",
         1: "EEG4",
         2: "EEG8",
         3: "DRL_REF",
@@ -276,26 +222,66 @@ def assess_types_ids(data, location=12):
         8: "Battery",
     }
 
-    dtype_ids, err_rate = _extract_type_ids(data, location=location)
-    counts = pd.Series(dtype_ids).value_counts().sort_index()
-    counts = pd.DataFrame(counts)
-    counts["type"] = counts.index.map(DATA_TYPE_MAP)
-    unexpected = counts[counts["type"].isna()]["count"].sum() / counts["count"].sum()
-
-    # Check if contains at least EEG or ACC_GYRO
-    contains = 0 if any(counts["type"].isin(["EEG4", "EEG8", "ACC_GYRO"])) else 1
-
-    return {
-        "TypeLoc": location,
-        "TypeParseErrors": err_rate,
-        "TypeUnexpected": unexpected,
-        "TypeCounts": (8 - len(counts["type"].dropna())) / 8,
-        "TypeRelevant": contains,
+    EXPECTED_FREQ_BY_TYPE = {
+        "EEG4": 256.0,
+        "EEG8": 256.0,
+        "ACC_GYRO": 52.0,
+        "Optics4": 64.0,
+        "Optics8": 64.0,
+        "Optics16": 64.0,
+        "Battery": None,
+        "DRL_REF": None,
     }
+
+    # Extract nibbles ----------------------------------------------------
+    freq_ids, type_ids = [], []
+    errors = 0
+    for payload in data:
+        if len(payload) < location:
+            errors += 1
+            continue
+        id_byte = payload[location - 1]
+        freq_ids.append((id_byte >> 4) & 0x0F)
+        type_ids.append(id_byte & 0x0F)
+
+    n = len(data)
+    parse_err_rate = errors / n if n > 0 else 1.0
+
+    rez = {"IDLoc": location, "IDParseErrors": parse_err_rate}
+
+    # Frequency summary --------------------------------------------------
+    freq_counts = pd.Series(freq_ids).value_counts().sort_index()
+    freq_df = pd.DataFrame({"count": freq_counts})
+    freq_df["freq_hz"] = freq_df.index.map(FREQ_MAP)
+    rez["FreqUnknown"] = (
+        freq_df[freq_df["freq_hz"].isna()]["count"].sum() / freq_df["count"].sum()
+    )
+
+    corr = freq_df["count"].corr(freq_df["freq_hz"], method="spearman")
+    rez["FreqPattern"] = 1 - np.abs(corr) if len(freq_df) > 2 else 1.0
+
+    # Type summary -------------------------------------------------------
+    type_counts = pd.Series(type_ids).value_counts().sort_index()
+    type_df = pd.DataFrame({"count": type_counts})
+    type_df["type"] = type_df.index.map(DATA_TYPE_MAP)
+    rez["TypeUnknown"] = (
+        type_df[type_df["type"].isna()]["count"].sum() / type_df["count"].sum()
+    )
+    rez["TypeDiversity"] = (8 - len(type_df["type"].dropna())) / 8
+    rez["TypeUseful"] = int(not any(type_df["type"].isin(["EEG4", "EEG8", "ACC_GYRO"])))
+
+    # Consistency check --------------------------------------------------
+    type_df["freq_hz2"] = type_df["type"].map(EXPECTED_FREQ_BY_TYPE)
+    merged = freq_df.merge(type_df, on="count", how="inner")
+    merged["freq_diff"] = np.abs(merged["freq_hz"] - merged["freq_hz2"])
+
+    rez["TypeFreqMismatch"] = merged["freq_diff"].mean()
+
+    return rez
 
 
 # Assessment -------------------------------------------
-def assess_structure(filename, loc_freq=10, loc_type=12):
+def assess_structure(filename, loc_id=12):
     with open(os.path.join(data_dir, filename), "r", encoding="utf-8") as f:
         lines = f.readlines()
     times, uuids, data, err_rate = _parse_lines(lines)
@@ -305,8 +291,7 @@ def assess_structure(filename, loc_freq=10, loc_type=12):
         "LineStructureErrors": err_rate,
     }
 
-    result.update(assess_freq_ids(data, location=loc_freq))
-    result.update(assess_types_ids(data, location=loc_type))
+    result.update(assess_id_bytes(data, location=loc_id))
 
     return pd.DataFrame(result, index=[0])
 
@@ -319,66 +304,47 @@ if __name__ == "__main__":
     files = sorted(os.listdir(data_dir))
 
     results = []
-    optimized_freq = []
-    optimized_type = []
 
     for filename in files:
         print(f"Processing {filename}...")
 
-        result = assess_structure(filename, loc_freq=12)
-        results.append(result)
+        # Grid search for best ID byte location (joint freq+type check)
+        grid = [assess_structure(filename, loc_id=loc_id) for loc_id in range(8, 20)]
+        grid = pd.concat([d.dropna(how="all", axis=1) for d in grid], ignore_index=True)
 
-        # Grid search for different freq id locations (result: suggests 10 is best )
-        best_loc_freq = []
-        for loc_freq in range(8, 20):
-            best_loc_freq.append(assess_structure(filename, loc_freq=loc_freq))
-        best_loc_freq = pd.concat(best_loc_freq, ignore_index=True)
+        # Score: combine how well freq + type match expectations
         score = (
-            best_loc_freq["FreqUnnexpected"] + best_loc_freq["FreqExpectedPattern"]
-        ) / 2
-        optimized_freq.append(
-            assess_structure(
-                filename, loc_freq=best_loc_freq["FreqLoc"][score.idxmin()]
-            )[
-                [
-                    "Preset",
-                    "FreqLoc",
-                    "FreqParseErrors",
-                    "FreqUnnexpected",
-                    "FreqExpectedPattern",
-                ]
-            ]
-        )
+            grid["FreqUnknown"]
+            + grid["FreqPattern"]
+            + grid["TypeUnknown"]
+            + grid["TypeUseful"]
+        ) / 4
 
-        # Grid search for different type id locations (result: suggests 12 is best )
-        best_loc_type = []
-        for loc_type in range(10, 20):
-            best_loc_type.append(
-                assess_structure(filename, loc_freq=10, loc_type=loc_type)
-            )
-        best_loc_type = pd.concat(best_loc_type, ignore_index=True)
-        score = (best_loc_type["TypeUnexpected"] + best_loc_type["TypeRelevant"]) / 2
-        optimized_type.append(
-            assess_structure(
-                filename, loc_freq=10, loc_type=best_loc_type["TypeLoc"][score.idxmin()]
-            )[
-                [
-                    "Preset",
-                    "TypeLoc",
-                    "TypeParseErrors",
-                    "TypeUnexpected",
-                    "TypeCounts",
-                    "TypeRelevant",
-                ]
-            ]
-        )
+        # Pick best location
+        best_idx = score.idxmin()
+        results.append(grid.loc[[best_idx], :])
 
     results = pd.concat(results, ignore_index=True)
-    optimized_freq = pd.concat(optimized_freq, ignore_index=True)
-    optimized_type = pd.concat(optimized_type, ignore_index=True)
 
-    # print(results.to_markdown(floatfmt=(".2f")))
-    print("\nFreq bytes results:")
-    print(optimized_freq.to_markdown(floatfmt=(".2f")))
-    print("\nType bytes results:")
-    print(optimized_type.to_markdown(floatfmt=(".2f")))
+    print("\nID byte results:")
+    print(results.to_markdown(floatfmt=(".2f")))
+
+
+# ID byte results:
+# |    | Preset   |   LineStructureErrors |   IDLoc |   IDParseErrors |   FreqUnknown |   FreqPattern |   TypeUnknown |   TypeDiversity |   TypeUseful |   TypeFreqMismatch |
+# |---:|:---------|----------------------:|--------:|----------------:|--------------:|--------------:|--------------:|----------------:|-------------:|-------------------:|
+# |  0 | p1034    |                  0.00 |      10 |            0.00 |          0.00 |          0.00 |          0.00 |            0.38 |            0 |               0.00 |
+# |  1 | p1035    |                  0.00 |      10 |            0.00 |          0.00 |          0.10 |          0.00 |            0.38 |            0 |               0.00 |
+# |  2 | p1041    |                  0.00 |      10 |            0.00 |          0.00 |          0.00 |          0.00 |            0.38 |            0 |               0.00 |
+# |  3 | p1042    |                  0.00 |      10 |            0.00 |          0.00 |          0.00 |          0.00 |            0.38 |            0 |               0.00 |
+# |  4 | p1043    |                  0.00 |      10 |            0.00 |          0.00 |          0.00 |          0.00 |            0.38 |            0 |               0.00 |
+# |  5 | p1044    |                  0.00 |      10 |            0.00 |          0.00 |          0.00 |          0.00 |            0.38 |            0 |               0.00 |
+# |  6 | p1045    |                  0.00 |      10 |            0.00 |          0.00 |          0.10 |          0.00 |            0.38 |            0 |               0.00 |
+# |  7 | p1046    |                  0.00 |      10 |            0.00 |          0.00 |          0.10 |          0.00 |            0.38 |            0 |               0.00 |
+# |  8 | p20      |                  0.00 |      10 |            0.00 |          0.00 |          0.00 |          0.00 |            0.50 |            0 |               0.00 |
+# |  9 | p21      |                  0.00 |      10 |            0.00 |          0.00 |          0.00 |          0.00 |            0.50 |            0 |               0.00 |
+# | 10 | p4129    |                  0.00 |      10 |            0.00 |          0.00 |          0.10 |          0.00 |            0.38 |            0 |               0.00 |
+# | 11 | p50      |                  0.00 |      10 |            0.00 |          0.00 |          0.00 |          0.00 |            0.50 |            0 |               0.00 |
+# | 12 | p51      |                  0.00 |      10 |            0.00 |          0.00 |          0.00 |          0.00 |            0.50 |            0 |               0.00 |
+# | 13 | p60      |                  0.00 |      10 |            0.00 |          0.00 |          0.00 |          0.00 |            0.50 |            0 |               0.00 |
+# | 14 | p61      |                  0.00 |      10 |            0.00 |          0.00 |          0.00 |          0.00 |            0.50 |            0 |               0.00 |
