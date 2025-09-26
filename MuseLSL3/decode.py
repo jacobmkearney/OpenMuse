@@ -4,6 +4,18 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+
+# Packet structure -------------------
+# Offset (0-based)   Field
+# -----------------  -----------------------------------------
+# 0                  SUBPKT_LEN       (1 byte) [confirmed]
+# 1                  SUBPKT_N         (1 byte)
+# 2–5                SUBPKT_T         (uint32, ms since device start) [confirmed]
+# 6–8                SUBPKT_UNKNOWN1  (3 bytes, reserved?)
+# 9                  SUBPKT_ID        (freq/type nibbles) [confirmed]
+# 10–13              SUBPKT_UNKNOWN2  (unknown, first one could be a counter)
+# 14...              SUBPKT_DATA      (samples, tightly packed)
+
 # Constants ----------------------------
 # GYRO/ACC settings
 
@@ -16,9 +28,34 @@ GYRO_MIN_BLOCK_LEN = GYRO_HEADER_LEN + GYRO_BLOCK_BYTES
 # -------------------------------------
 
 
-def extract_time(payload: bytes):
+def extract_pkt_length(payload: bytes):
     """
-    Extract packet time from a single payload. 4-byte unsigned little-endian at offset 3 -> milliseconds.
+    Extract the SUBPKT_LEN field (declared length) from a Muse payload.
+    """
+    if not payload:
+        return None
+
+    declared_len = payload[0]
+    return declared_len, (declared_len == len(payload))
+
+
+def extract_pkt_n(payload: bytes):
+    """
+    Extract the SUBPKT_N field (1-byte sequence number) from a Muse payload.
+
+    - Located at offset 1 (0-based). Increments by 1 per packet, wraps at 255 -> 0.
+    - Useful for detecting dropped or out-of-order packets (quality check assessment).
+
+    Returns the integer sequence number (0-255), or None if payload too short.
+    """
+    if len(payload) <= 1:
+        return None
+    return payload[1]
+
+
+def extract_pkt_time(payload: bytes):
+    """
+    Extract subpkt time from a single payload. 4-byte unsigned little-endian at offset 3 -> milliseconds.
     """
     # primary 4-byte little-endian at offset 3
     if len(payload) >= 3 + 4:
@@ -28,7 +65,51 @@ def extract_time(payload: bytes):
     return None
 
 
-def extract_gyroacc(payload: bytes, time_prev: Optional[float], time_current: float):
+def extract_pkt_id(payload: bytes):
+    """
+    Extract and parse the ID byte from a Muse payload.
+    - ID byte is at offset 9 (0-based).
+    - Upper nibble = frequency code.
+    - Lower nibble = data type code.
+    Returns dict with raw codes and decoded labels.
+    """
+
+    if len(payload) <= 9:
+        return None  # not enough data
+
+    # Lookup tables
+    FREQ_MAP = {
+        1: 256.0,
+        2: 128.0,
+        3: 64.0,
+        4: 52.0,
+        5: 32.0,
+        6: 16.0,
+        7: 10.0,
+        8: 1.0,
+        9: 0.1,
+    }
+    TYPE_MAP = {
+        1: "EEG4",
+        2: "EEG8",
+        3: "REF",
+        4: "Optics4",
+        5: "Optics8",
+        6: "Optics16",
+        7: "ACCGYRO",
+        8: "Battery",
+    }
+
+    id_byte = payload[9]
+    freq_code = (id_byte >> 4) & 0x0F
+    type_code = id_byte & 0x0F
+
+    return FREQ_MAP.get(freq_code), TYPE_MAP.get(type_code)
+
+
+def extract_pkt_accgyro(
+    payload: bytes, time_prev: Optional[float], time_current: float
+):
     """
     Yield per-sample tuples:
       (time_s, acc_x_g, acc_y_g, acc_z_g, gyro_x_dps, gyro_y_dps, gyro_z_dps)
@@ -80,6 +161,28 @@ def extract_gyroacc(payload: bytes, time_prev: Optional[float], time_current: fl
             t_s = time_prev + (sample_index + 1) * dt_s_uniform
             yield (t_s, acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z)
             sample_index += 1
+
+
+# MASTER FUNCTIONS --------------------
+def decode_payload(
+    payload: bytes,
+    time_prev: Optional[float] = None,
+):
+
+    # --- Header fields ---
+    pkt_len, length_ok = extract_pkt_length(payload)
+    pkt_n = extract_pkt_n(payload)
+    pkt_time = extract_pkt_time(payload)
+    pkt_freq, pkt_type = extract_pkt_id(payload)
+
+    if not length_ok:
+        return None  # incomplete packet
+
+    # # --- Decode ACC/GYRO samples if applicable ---
+    # if pkt_type and pkt_type == "ACCGYRO" and pkt_time is not None:
+    #     samples = list(extract_pkt_accgyro(payload, time_prev, pkt_time))
+    #     result["samples"] = samples
+    # TODO
 
 
 # Convenience: collect into NumPy arrays in one allocation
@@ -135,11 +238,10 @@ def decode_rawdata(lines: list[str]):
     t_prev = None
 
     for pkt in data:
-        t_current = extract_time(pkt)
+        t_current = extract_pkt_time(pkt)
 
-        it = extract_gyroacc(pkt, t_prev, t_current)
+        it = extract_pkt_accgyro(pkt, t_prev, t_current)
         acc, gyro = stream_to_arrays(it)
-        # acc, gyro = extract_gyroacc(pkt, t_prev, t_current)
         if acc.size:
             acc_chunks.append(acc)
             gyro_chunks.append(gyro)
