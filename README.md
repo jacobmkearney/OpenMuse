@@ -69,9 +69,19 @@ Muse S Athena specs (From the [Muse website](https://eu.choosemuse.com/products/
 ### Presets
 
 Different presets enable/disable some channels, but the exact combinations are not fully documented.
-- p20-p61: Red LED in the centre is off
-- p1034, p1041, p1042, p1043: red LED in the centre is brightly on (suggesting the activation of OPTICS or PPG channels)
-- p1035, p1044, p1045, p4129: red LED in the centre is dimmer
+
+| Presets                                 | EEG   | REF     | PPG     | Optics   | ACC/GYRO | Battery | Red LED |
+|-----------------------------------------|:-----:|:-------:|:-------:|:--------:|:--------:|:-------:|:--------|
+| p20, p21, p50, p51, p60, p61            | EEG4  | DRL_REF |         |          |    X     |    X    |   off   |
+| p1034, p1043                            | EEG8  | DRL_REF |    X    | Optics8  |    X     |    X    | bright  |
+| p1044                                   | EEG8  | DRL_REF |    X    | Optics8  |    X     |    X    |  dim    |
+| p1035                                   | EEG4  | DRL_REF |    X    | Optics4  |    X     |    X    |  dim    |
+| p1041, p1042                            | EEG8  | DRL_REF |    X    | Optics16 |    X     |    X    | bright  |
+| p1045                                   | EEG8  | DRL_REF |    X    | Optics4  |    X     |    X    |  dim    |
+| p1046                                   | EEG8  | DRL_REF |    X    | Optics4  |    X     |    X    |   —     |
+| p4129                                   | EEG8  | DRL_REF |    X    | Optics4  |    X     |    X    |  dim    |
+
+*Table derived from the signature of the data packets present in the data.*
 
 ### Attempt 
 
