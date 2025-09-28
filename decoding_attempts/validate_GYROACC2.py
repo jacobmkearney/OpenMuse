@@ -450,3 +450,137 @@ for file in files:
     axs[-1, 1].set_xlabel("Relative Time (s)")
     plt.tight_layout()
     plt.show()
+
+
+# --------------------------------------------------------------------
+# ISOLATION
+# --------------------------------------------------------------------
+
+import struct
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# --- Core decoder ---
+
+
+def extract_pkt_accgyro(payload: bytes, time: float):
+    HEADER_OFFSET = 14
+    GYRO_TAG = 0x47
+    GYRO_DT = 1.0 / 52.0
+
+    if len(payload) <= HEADER_OFFSET:
+        return None
+
+    data = payload[HEADER_OFFSET:]
+    nbytes = len(data)
+    blocks, pos = [], 0
+
+    while pos < nbytes:
+        idx = data.find(bytes([GYRO_TAG]), pos)
+        if idx == -1:
+            break
+        block_start = idx + 1 + 4  # tag + 4 hdr
+        if block_start + 36 > nbytes:
+            break
+        try:
+            raw18 = struct.unpack_from("<18h", data, block_start)
+            blocks.append(raw18)
+        except struct.error:
+            pos = idx + 1
+            continue
+        pos = block_start + 36
+
+    if not blocks:
+        return None
+
+    raw_all = np.array(blocks, dtype=np.int16).reshape(-1, 6)
+    acc = raw_all[:, :3].astype(np.float32) / 16384.0
+    gyr = raw_all[:, 3:6].astype(np.float32) / 131.0
+    n_samples = raw_all.shape[0]
+    ts = time - (n_samples - 1) * GYRO_DT + GYRO_DT * np.arange(n_samples)
+
+    return {"time": ts, "ACC": acc, "GYRO": gyr}
+
+
+def extract_pkt_time(payload: bytes):
+    if len(payload) >= 6:
+        ms = struct.unpack_from("<I", payload, 2)[0]
+        return ms * 1e-3
+    return None
+
+
+def extract_pkt_id(payload: bytes):
+    if len(payload) <= 9:
+        return None, None
+    TYPE_MAP = {7: "ACCGYRO"}
+    id_byte = payload[9]
+    type_code = id_byte & 0x0F
+    return None, TYPE_MAP.get(type_code)
+
+
+def decode_rawdata(lines):
+    decoded = []
+    prev_imu_time = None
+
+    for ln in lines:
+        parts = ln.strip().split("\t")
+        if len(parts) < 3:
+            continue
+        try:
+            ts = pd.to_datetime(parts[0]).timestamp()
+            payload = bytes.fromhex(parts[2])
+        except Exception:
+            continue
+
+        pkt_time = extract_pkt_time(payload)
+        _, pkt_type = extract_pkt_id(payload)
+        if pkt_type == "ACCGYRO":
+            pkt = extract_pkt_accgyro(payload, pkt_time)
+            if pkt:
+                decoded.append(pkt)
+
+    if not decoded:
+        return pd.DataFrame(), pd.DataFrame()
+
+    acc_chunks = [np.hstack([d["time"][:, None], d["ACC"]]) for d in decoded]
+    gyr_chunks = [np.hstack([d["time"][:, None], d["GYRO"]]) for d in decoded]
+
+    df_acc = pd.DataFrame(
+        np.vstack(acc_chunks), columns=["time", "ACC_X", "ACC_Y", "ACC_Z"]
+    )
+    df_gyr = pd.DataFrame(
+        np.vstack(gyr_chunks), columns=["time", "GYRO_X", "GYRO_Y", "GYRO_Z"]
+    )
+    return df_acc, df_gyr
+
+
+# --- Main ---
+
+file = "./data_raw/data_p1045.txt"  # change to your file
+with open(file, "r") as f:
+    lines = f.readlines()
+
+df_acc, df_gyr = decode_rawdata(lines)
+
+fig, axs = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+if not df_acc.empty:
+    t_rel = df_acc["time"] - df_acc["time"].min()
+    for col in ["ACC_X", "ACC_Y", "ACC_Z"]:
+        axs[0].plot(t_rel, df_acc[col], label=col)
+    axs[0].set_title("Accelerometer")
+    axs[0].legend()
+    axs[0].grid(True)
+
+if not df_gyr.empty:
+    t_rel = df_gyr["time"] - df_gyr["time"].min()
+    for col in ["GYRO_X", "GYRO_Y", "GYRO_Z"]:
+        axs[1].plot(t_rel, df_gyr[col], label=col)
+    axs[1].set_title("Gyroscope")
+    axs[1].legend()
+    axs[1].grid(True)
+
+axs[1].set_xlabel("Relative Time (s)")
+plt.tight_layout()
+plt.show()
