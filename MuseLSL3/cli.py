@@ -37,11 +37,11 @@ def main(argv=None):
         "--address", required=True, help="Device address (e.g., MAC on Windows)"
     )
     p_rec.add_argument(
-        "--timeout",
-        "-t",
+        "--duration",
+        "-d",
         type=float,
         default=30.0,
-        help="Recording timeout in seconds (default: 30)",
+        help="Recording duration in seconds (default: 30)",
     )
     p_rec.add_argument(
         "--outfile", "-o", default="muse_record.txt", help="Output text file path"
@@ -51,11 +51,11 @@ def main(argv=None):
     )
 
     def handle_record(ns):
-        if ns.timeout <= 0:
-            parser.error("--timeout must be positive")
+        if ns.duration <= 0:
+            parser.error("--duration must be positive")
         record(
             address=ns.address,
-            timeout=ns.timeout,
+            duration=ns.duration,
             outfile=ns.outfile,
             preset=ns.preset,
             verbose=True,
@@ -63,6 +63,93 @@ def main(argv=None):
         return 0
 
     p_rec.set_defaults(func=handle_record)
+
+    # stream subcommand
+    p_stream = subparsers.add_parser(
+        "stream",
+        help="Stream decoded accelerometer and gyroscope data over LSL",
+    )
+    p_stream.add_argument(
+        "--address",
+        required=True,
+        help="Device address (e.g., MAC on Windows)",
+    )
+    p_stream.add_argument(
+        "--preset",
+        default="p1035",
+        help="Preset to send (e.g., p1035 or p21)",
+    )
+    p_stream.add_argument(
+        "--duration",
+        "-d",
+        type=float,
+        default=None,
+        help="Optional stream duration in seconds. Omit to stream until interrupted.",
+    )
+    p_stream.add_argument(
+        "--outfile",
+        "-o",
+        default=None,
+        help="Optional output file to save decoded ACC/GYRO samples. Omit to only stream.",
+    )
+
+    def handle_stream(ns):
+        from .stream import stream
+
+        if ns.duration is not None and ns.duration <= 0:
+            parser.error("--duration must be positive when provided")
+        stream(
+            address=ns.address,
+            preset=ns.preset,
+            duration=ns.duration,
+            outfile=ns.outfile,
+            verbose=True,
+        )
+        return 0
+
+    p_stream.set_defaults(func=handle_stream)
+
+    # view subcommand
+    p_view = subparsers.add_parser(
+        "view",
+        help="Visualize ACC/GYRO data from an LSL stream in real-time",
+    )
+    p_view.add_argument(
+        "--stream-name",
+        default="MuseAccGyro",
+        help="Name of the LSL stream to visualize (default: MuseAccGyro)",
+    )
+    p_view.add_argument(
+        "--window",
+        "-w",
+        type=float,
+        default=10.0,
+        help="Time window to display in seconds (default: 10.0)",
+    )
+    p_view.add_argument(
+        "--duration",
+        "-d",
+        type=float,
+        default=None,
+        help="Optional viewing duration in seconds. Omit to view until window closed.",
+    )
+
+    def handle_view(ns):
+        from .view import view
+
+        if ns.window <= 0:
+            parser.error("--window must be positive")
+        if ns.duration is not None and ns.duration <= 0:
+            parser.error("--duration must be positive when provided")
+        view(
+            stream_name=ns.stream_name,
+            duration=ns.duration,
+            window_size=ns.window,
+            verbose=True,
+        )
+        return 0
+
+    p_view.set_defaults(func=handle_view)
 
     args = parser.parse_args(argv)
     try:

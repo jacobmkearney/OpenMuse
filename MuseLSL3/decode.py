@@ -128,7 +128,9 @@ def decode_message(message: str) -> Optional[Dict[str, List[dict]]]:
     ts_str, _uuid, hexstr = parts
 
     try:
-        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        # Parse timestamp and convert to float (seconds since epoch)
+        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        ts = dt.timestamp()  # Convert to float seconds
     except Exception:
         ts = None
 
