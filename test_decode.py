@@ -1,22 +1,35 @@
 import MuseLSL3
 import json
 import pandas as pd
+import matplotlib.pyplot as plt
+import urllib.request
 
 # --------------------------------
 # Raw data
 # --------------------------------
 
-with open("data.txt") as f:
+
+# url = "https://raw.githubusercontent.com/DominiqueMakowski/MuseLSL3/refs/heads/main/decoding_attempts/data_raw/data_p1034.txt"
+# lines = urllib.request.urlopen(url).read().decode("utf-8").splitlines()
+
+with open("data_accgyro.txt") as f:
     lines = f.readlines()
 
 data = MuseLSL3.decode_rawdata(lines)
-acc = data["ACC"]
-acc["time"] = acc["time"] - acc["time"].iloc[0]
-acc.plot(x="time", y=["ACC_X", "ACC_Y", "ACC_Z"], subplots=True)
 
-gyro = data["GYRO"]
+acc, gyro = data["ACC"], data["GYRO"]
+acc["time"] = acc["time"] - acc["time"].iloc[0]
 gyro["time"] = gyro["time"] - gyro["time"].iloc[0]
-gyro.plot(x="time", y=["GYRO_X", "GYRO_Y", "GYRO_Z"], subplots=True)
+
+fig, axs = plt.subplots(6, 1, sharex=True, figsize=(10, 6))
+p1 = acc.plot(x="time", y=["ACC_X", "ACC_Y", "ACC_Z"], subplots=True, ax=axs[0:3])
+p1[0].set_title("ACC")
+p2 = gyro.plot(x="time", y=["GYRO_X", "GYRO_Y", "GYRO_Z"], subplots=True, ax=axs[3:6])
+p2[0].set_title("GYRO")
+
+plt.tight_layout()
+plt.show()
+fig.savefig("rawdata_v0.1.png")
 
 
 for i, line in enumerate(lines[:5]):

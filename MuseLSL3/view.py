@@ -92,12 +92,15 @@ def view(
     start_time = time.time()
     samples_received = 0
 
-    # Track timestamps for rate calculation
+    # Track ALL timestamps for final statistics (never pruned)
+    all_timestamps = []
+
+    # Track recent timestamps for real-time rate display
     recent_timestamps = []
     rate_window = 1.0  # Calculate rate over last 1 second
 
     def update(frame):
-        nonlocal samples_received, recent_timestamps
+        nonlocal samples_received, recent_timestamps, all_timestamps
 
         # Pull new data from the stream
         try:
@@ -110,14 +113,20 @@ def view(
 
         samples_received += data.shape[1]
 
-        # Update timestamp tracking for rate calculation using actual LSL timestamps
-        # timestamps is a numpy array of LSL timestamps for each sample
-        current_time = time.time()
-        recent_timestamps.extend(timestamps.tolist())
+        # Update timestamp tracking
+        if len(timestamps) > 0:
+            ts_list = timestamps.tolist()
 
-        # Remove timestamps older than rate_window
-        cutoff_time = current_time - rate_window
-        recent_timestamps = [t for t in recent_timestamps if t >= cutoff_time]
+            # Keep ALL timestamps for final statistics
+            all_timestamps.extend(ts_list)
+
+            # Keep recent timestamps for real-time rate display
+            recent_timestamps.extend(ts_list)
+
+            # Remove timestamps older than rate_window for real-time display
+            if len(recent_timestamps) > 0:
+                cutoff_time = recent_timestamps[-1] - rate_window
+                recent_timestamps = [t for t in recent_timestamps if t >= cutoff_time]
 
         # Update buffer with new data
         n_new = data.shape[1]
@@ -177,4 +186,15 @@ def view(
             print(f"\nVisualization stopped.")
             print(f"  Duration: {elapsed:.1f} seconds")
             print(f"  Samples received: {samples_received}")
-            print(f"  Average rate: {samples_received / elapsed:.1f} Hz")
+
+            # Calculate average rate from all collected LSL timestamps
+            if len(all_timestamps) > 1:
+                lsl_duration = all_timestamps[-1] - all_timestamps[0]
+                if lsl_duration > 0:
+                    avg_rate = (len(all_timestamps) - 1) / lsl_duration
+                    print(f"  Average rate: {avg_rate:.1f} Hz (from LSL timestamps)")
+                    print(f"  Data time span: {lsl_duration:.1f} seconds")
+                else:
+                    print(f"  Average rate: N/A (insufficient data)")
+            else:
+                print(f"  Average rate: N/A (no timestamps received)")
