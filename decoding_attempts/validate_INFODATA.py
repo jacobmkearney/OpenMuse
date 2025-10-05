@@ -1,7 +1,7 @@
 """
 infodata_inmemory.py
 
-Scan all .txt files under DATA_DIR, extract SUBPKT_UNKNOWN2 (bytes 10..13),
+Scan all .txt files under DATA_DIR, extract PKT_UNKNOWN2 (bytes 10..13),
 interpret the 4 bytes in several ways, compute diagnostics and heuristics,
 and print a compact markdown summary - all in memory, no disk writes.
 
@@ -545,3 +545,4 @@ for t, g in df.groupby("pkt_type"):
         print(f"u16_1={u}: n={len(sub)}, sample hexes: {sample_hexes}")
 
 print("\nDone.")
+

@@ -57,12 +57,12 @@ def parse_line(line):
 def extract_header(payload: bytes):
     if len(payload) < 14:
         return None
-    subpkt_len = payload[0]
+    pkt_len = payload[0]
     id_byte = payload[9]
     freq_code = (id_byte >> 4) & 0x0F
     type_code = id_byte & 0x0F
     return {
-        "declared_len": subpkt_len,
+        "declared_len": pkt_len,
         "actual_len": len(payload),
         "freq_code": freq_code,
         "freq_hz": FREQ_MAP.get(freq_code),
@@ -134,3 +134,4 @@ if __name__ == "__main__":
 # | data_p51.txt   |         836 |                              0.000 |                        0.000 | ['ACC_GYRO', 'EEG4', 'DRL_REF', 'Battery']             |
 # | data_p60.txt   |         836 |                              0.000 |                        0.000 | ['EEG4', 'DRL_REF', 'ACC_GYRO', 'Battery']             |
 # | data_p61.txt   |         837 |                              0.000 |                        0.000 | ['EEG4', 'DRL_REF', 'ACC_GYRO', 'Battery']             |
+

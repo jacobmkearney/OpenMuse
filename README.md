@@ -168,37 +168,7 @@ Different presets enable/disable some channels, but the exact combinations are n
 
 *Table derived from the signature of the data packets present in the data.*
 
-### Attempt 
 
-```python
-import urllib.request
-import matplotlib.pyplot as plt
-import MuseLSL3
-
-url = "https://raw.githubusercontent.com/DominiqueMakowski/MuseLSL3/refs/heads/main/decoding_attempts/data_raw/data_p1034.txt"
-
-lines = urllib.request.urlopen(url).read().decode("utf-8").splitlines()
-
-times, t = MuseLSL3.decode_rawdata(lines)
-plt.plot(times, t, ".")
-```
-
-### Successful Parsing
-
-✅ [Timestamp](./decoding_attempts/validate_Timestamp.py):
-
-```python
-import urllib.request
-import matplotlib.pyplot as plt
-import MuseLSL3
-
-url = "https://raw.githubusercontent.com/DominiqueMakowski/MuseLSL3/refs/heads/main/decoding_attempts/data_raw/data_p1034.txt"
-
-lines = urllib.request.urlopen(url).read().decode("utf-8").splitlines()
-
-times, t = MuseLSL3.decode_rawdata(lines)
-plt.plot(times, t, ".")
-```
 
 ## Related Projects
 

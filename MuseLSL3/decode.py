@@ -11,17 +11,17 @@ import pandas as pd
 # Packet structure -------------------------------------------
 # Offset (0-based)   Field
 # -----------------  -----------------------------------------
-# 0                  SUBPKT_LEN       (1 byte) [confirmed]
-# 1                  SUBPKT_N         (1 byte) [confirmed]
-# 2–5                SUBPKT_T         (uint32, ms since device start) [confirmed]
-# 6–8                SUBPKT_UNKNOWN1  (3 bytes, reserved?)
-# 9                  SUBPKT_ID        (freq/type nibbles) [confirmed]
-# 10–13              SUBPKT_METADATA  (4 bytes, little-endian; header metadata)
+# 0                  PKT_LEN       (1 byte) [confirmed]
+# 1                  PKT_N         (1 byte) [confirmed]
+# 2–5                PKT_T         (uint32, ms since device start) [confirmed]
+# 6–8                PKT_UNKNOWN1  (3 bytes, reserved?)
+# 9                  PKT_ID        (freq/type nibbles) [confirmed]
+# 10–13              PKT_METADATA  (4 bytes, little-endian; header metadata)
 # - interpretable as two little-endian uint16s:
 #   - u16_0 = bytes 10–11: high-variance 16-bit value (possibly per-packet offset / internal counter / fine-grained ID)
 #   - u16_1 = bytes 12–13: small discrete value ∈ {0,1,2,3} (likely a 2-bit slot/index / bank id)
 # - u8_3 (byte 13) is observed always 0 -> reserved/padding
-# 14...              SUBPKT_DATA      (multiplexed samples, tightly packed, repeating blocks)
+# 14...              PKT_DATA      (multiplexed samples, tightly packed, repeating blocks)
 # - ACC/GYRO (TO BE CONFIRMED): Each block:
 #   - [tag byte: 0x47]
 #   - [4-byte block header (unknown; possibly sub-counter or timestamp offset)]
@@ -127,12 +127,8 @@ def decode_message(message: str) -> Optional[Dict[str, List[dict]]]:
 
     ts_str, _uuid, hexstr = parts
 
-    try:
-        # Parse timestamp and convert to float (seconds since epoch)
-        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-        ts = dt.timestamp()  # Convert to float seconds
-    except Exception:
-        ts = None
+    dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    ts = dt.timestamp()  # Convert to float seconds
 
     try:
         packet = memoryview(bytes.fromhex(hexstr))
@@ -215,5 +211,10 @@ def decode_rawdata(messages: List[str]) -> Dict[str, pd.DataFrame]:
 
 # url = f"https://raw.githubusercontent.com/DominiqueMakowski/MuseLSL3/refs/heads/main/decoding_attempts/data_raw/data_p1045.txt"
 # lines = urllib.request.urlopen(url).read().decode("utf-8").splitlines()
+
+# with open("../tests/test_data/test_accgyro.txt", "r", encoding="utf-8") as f:
+#     lines = f.readlines()
 # data = MuseLSL3.decode_rawdata(lines)
+# data["ACC"]["time"] = data["ACC"]["time"] - data["ACC"]["time"].iloc[0]
 # data["ACC"].plot(x="time", y=["ACC_X", "ACC_Y", "ACC_Z"], subplots=True)
+
