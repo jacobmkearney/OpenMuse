@@ -3,8 +3,7 @@
 from .find import find_devices
 from .record import record
 from .muse import MuseS
-from .decode import decode_rawdata
-from .decode_new import parse_message, decode_battery
+from .decode import parse_message
 
 __version__ = "0.1.0"
 

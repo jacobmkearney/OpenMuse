@@ -85,7 +85,17 @@ TYPE_MAP = {
     8: "Battery",
 }
 
-# Based on the possible FREQ/TYPE combinations, possible ID TAG bytes are: 0x11, 0x12, 0x13, 0x34, 0x35, 0x36, 0x47, 0x98
+# Based on the possible FREQ/TYPE combinations, possible ID TAG bytes are:
+TAGS = {
+    0x11: "EEG4",
+    0x12: "EEG8",
+    0x13: "REF",
+    0x34: "Optics4",
+    0x35: "Optics8",
+    0x36: "Optics16",
+    0x47: "ACCGYRO",
+    0x98: "Battery",
+}
 
 ACC_SCALE = 0.0000610352
 GYRO_SCALE = -0.0074768
@@ -102,24 +112,6 @@ def parse_message(message: str) -> List[Dict]:
         - ISO timestamp (BLE message arrival time)
         - UUID (BLE characteristic)
         - Hex-encoded payload
-
-    Returns:
-    --------
-    List[Dict]
-        List of dictionaries, one per packet, containing:
-        - message_time: Original BLE message timestamp (datetime)
-        - message_uuid: BLE characteristic UUID (str)
-        - pkt_offset: Byte offset of this packet in the payload (int)
-        - pkt_len: Declared packet length from byte 0 (int)
-        - pkt_n: Packet counter 0-255 from byte 1 (int)
-        - pkt_time: Device timestamp in seconds (float)
-        - pkt_unknown1: Reserved bytes 6-8 (bytes)
-        - pkt_freq: Sampling frequency in Hz (float or None)
-        - pkt_type: Sensor type (str or None)
-        - pkt_unknown2: Metadata bytes 10-12 (bytes)
-        - pkt_data: Decoded data tuple (times, data) for Battery subpackets,
-                       raw bytes for other types (tuple[np.ndarray, np.ndarray] or bytes)
-        - pkt_valid: True if packet passes validation checks (bool)
     """
     # Parse the message line
     try:
@@ -166,9 +158,6 @@ def parse_message(message: str) -> List[Dict]:
         pkt_freq = FREQ_MAP.get(freq_code)
         pkt_type = TYPE_MAP.get(type_code)
 
-        # Extract data section
-        pkt_data = pkt[14:] if len(pkt) > 14 else b""
-
         # Validate packet
         pkt_valid = (
             pkt_freq is not None  # Frequency code is recognized
@@ -178,12 +167,21 @@ def parse_message(message: str) -> List[Dict]:
             and pkt_len >= 14  # Minimum header size
         )
 
+        # Extract data section
+        pkt_data = pkt[14:] if len(pkt) > 14 else b""
+
         leftover = None
-        # Decode battery percentage if this is a Battery subpacket
+
+        data_accgyro = []
+        data_battery = []
+
+        # Parse data
         if pkt_valid and pkt_type == "Battery":
-            pkt_data, leftover = decode_battery(pkt_data, pkt_time)
+            d, leftover = decode_battery(pkt_data, pkt_time)
+            data_battery.append(d)
         if pkt_valid and pkt_type == "ACCGYRO":
-            pkt_data, leftover = decode_accgyro(pkt_data, pkt_time)
+            d, leftover = decode_accgyro(pkt_data, pkt_time)
+            data_accgyro.append(d)
 
         # Build subpacket dictionary with only requested fields
         subpkt_dict = {
@@ -197,9 +195,10 @@ def parse_message(message: str) -> List[Dict]:
             "pkt_freq": pkt_freq,
             "pkt_type": pkt_type,
             "pkt_unknown2": pkt_unknown2,
-            "pkt_data": pkt_data,
             "pkt_valid": pkt_valid,
             "leftover": leftover,
+            "data_accgyro": data_accgyro,
+            "data_battery": data_battery,
         }
 
         subpackets.append(subpkt_dict)
@@ -285,17 +284,3 @@ def decode_accgyro(pkt_data: bytes, pkt_time: float):
     leftover = pkt_data[bytes_needed:]  # leftover bytes undecoded
 
     return data, leftover
-
-
-# with open("../tests/test_data/test_accgyro.txt", "r", encoding="utf-8") as f:
-#     messages = f.readlines()
-# pkts = [parse_message(m) for m in messages]
-# print(f"Total packets: {len(pkts)}")
-# accgyro = [p for sublist in pkts for p in sublist if p["pkt_type"] == "ACCGYRO"]
-# data = np.vstack([a["pkt_data"] for a in accgyro if a["pkt_valid"]])
-# data = pd.DataFrame(
-#     data, columns=["time", "ACC_X", "ACC_Y", "ACC_Z", "GYRO_X", "GYRO_Y", "GYRO_Z"]
-# )
-
-# data.plot(x="time", y=["ACC_X", "ACC_Y", "ACC_Z", "GYRO_X", "GYRO_Y", "GYRO_Z"], subplots=True)
-# leftovers = [a["leftover"] for a in accgyro if a["pkt_valid"] and a["leftover"]]
