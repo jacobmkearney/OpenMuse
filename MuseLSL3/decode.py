@@ -43,6 +43,11 @@ Notes & Known Issues:
 
    These fields are preserved in output for future analysis.
 
+3. The BLE message structure is more sophisticated:
+- The main packet (with 14-byte header) contains a PRIMARY subpacket
+- After the primary subpacket data, SECONDARY subpackets may be bundled, identified by
+- This allows multiple sensor types to be transmitted in a single BLE message.
+
 Usage Example:
 --------------
 Example of raw BLE message (2 messages):
@@ -80,7 +85,7 @@ TYPE_MAP = {
     8: "Battery",
 }
 
-# Based on the FREQ/TYPE nibbles, possible ID bytes are: 0x11, 0x12, 0x13, 0x34, 0x35, 0x36, 0x47, 0x98
+# Based on the possible FREQ/TYPE combinations, possible ID TAG bytes are: 0x11, 0x12, 0x13, 0x34, 0x35, 0x36, 0x47, 0x98
 
 ACC_SCALE = 0.0000610352
 GYRO_SCALE = -0.0074768
