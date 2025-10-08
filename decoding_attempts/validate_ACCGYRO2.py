@@ -2,9 +2,7 @@
 validate_ACCGYRO.py
 ===================
 
-Compare two ACCGYRO decoding approaches:
-1. Current approach (decode.py): Searches for 0x47 tag in raw payload
-2. New approach: Uses parse_message() to split into packets first, then searches for 0x47 in pkt_data
+Compare two ACCGYRO decoding approaches.
 
 This script processes test_accgyro.txt (90 seconds of recording with specific movements)
 and creates a side-by-side comparison plot showing the 6 channels (ACC_X, ACC_Y, ACC_Z,
@@ -22,93 +20,137 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from MuseLSL3.decode import decode_rawdata
-from MuseLSL3.decode_new import parse_message
-
-# Scaling factors from decode.py
-ACC_SCALE = 0.0000610352
-GYRO_SCALE = -0.0074768
 
 
-def decode_accgyro_new_method(messages):
+def decode_rawdata2(messages):
     """
-    This method differs from the old approach:
-    - OLD (decode.py): Raw direct search for 0x47 byte anywhere in message to identify ACCGYRO packets. Problem: includes extra data samples, likely false positives included when 0x47 tag appears in sample data.
-    - NEW: Uses parse_message() (in decode_new.py) to first validate packets (which should [TO BE CONFIRMED] also identify ACCGYRO packets based on PKT_ID - byte 9 = 0x47), then parse data directly. Goal: avoid false positives.
+    Decode ACC + GYRO from Muse-style messages, skipping all other packet types.
 
-    Expected sampling rate: 52 Hz (based on FREQ_MAP[4] = 52.0)
-
-    Problem
-    -------
-    For most of the instances, I would expect method 1 and 2 to return the same packets and parse the same data (with method 1 finding some extra false positive packets, hopefully avoided by method 2). But that does not seem to be what is happening. Method 2 gives nonsensical data.
-
-    Ideally:
-    - Method 1: Identifies packets based on 0x47 TAG search, and data parsing with fixed sample size (3 samples x 6 channels). Includes some false positive possible due to tag present in the data payload.
-    - Method 2: Finds packet based on TAG but makes sure they are packets and not portions of data, then parses the data payload.
-
-    Parameters
-    ----------
-    messages : list of str
-        Raw BLE messages
+    Each message must be a string: "ISO_TIMESTAMP \\t UUID \\t HEXSTRING".
+    This version ensures proper alignment:
+      - Scans byte-by-byte until a recognised tag is found
+      - Skips over the correct block size for known tags
+      - Stops gracefully for incomplete packets
 
     Returns
     -------
-    dict
-        Dictionary with 'ACC' and 'GYRO' keys, each containing list of samples
+    dict of pandas.DataFrame
+        Keys: 'ACC' and 'GYRO'
     """
-    results = {"ACC": [], "GYRO": []}
+    import struct
+    from datetime import datetime
+    import pandas as pd
 
-    for message in messages:
-        # Parse message into validated packets with type identification
-        packets = parse_message(message)
+    # ------------------------------------------------------------------
+    # Constants
+    # ------------------------------------------------------------------
+    ACC_SCALE = 0.0000610352
+    GYRO_SCALE = -0.0074768
+    HEADER_LEN = 4
 
-        if not packets:
-            continue
+    # Tag → payload length (excluding tag + header)
+    PAYLOAD_MAP = {
+        0x11: 14,  # EEG4 (4 channels)
+        0x12: 28,  # EEG8 (8 channels)
+        0x13: 7,  # REF (2 channels)
+        0x34: 24,  # Optics4 (4 channels × 3 samples)
+        0x35: 48,  # Optics8 (8 channels × 3 samples)
+        0x36: 96,  # Optics16 (16 channels × 3 samples)
+        0x47: 36,  # ACCGYRO (6 channels × 3 samples)
+        0x98: 4,  # Battery
+    }
 
-        # Get message timestamp (system time when BLE message was received)
-        msg_time = packets[0]["message_time"].timestamp()
-
-        # Process only ACCGYRO packets (PKT_ID = 0x47)
-        for pkt in packets:
-            # Only process valid ACCGYRO packets
-            if not pkt["pkt_valid"] or pkt["pkt_type"] != "ACCGYRO":
-                continue
-
-            # Get the packet data section (bytes 14+ of packet)
-            pkt_data = pkt["pkt_data"]
-
-            # ACCGYRO packet data structure:
-            # Repeating blocks of 3 samples, each sample has 6 int16 values
-            # Block size: 3 samples × 6 channels × 2 bytes = 36 bytes
-
-            # Parse data in 36-byte chunks
-            offset = 0
-            bytes_per_block = 36  # 3 samples × 6 channels × 2 bytes
-
-            # Extract one block of 3 samples
-            block = pkt_data[offset : offset + bytes_per_block]
-
-            # Decode 18 signed int16 values (little-endian)
-            # Each sample: ACC_X, ACC_Y, ACC_Z, GYRO_X, GYRO_Y, GYRO_Z
+    # ------------------------------------------------------------------
+    # Helper: parse ACCGYRO blocks
+    # ------------------------------------------------------------------
+    def parse_accgyro_block(block: bytes, ts: float):
+        """Parse one 36-byte ACC/GYRO block into scaled dicts."""
+        acc_rows, gyro_rows = [], []
+        try:
             for ax, ay, az, gx, gy, gz in struct.iter_unpack("<6h", block):
-                # Apply scaling factors and store
-                results["ACC"].append(
+                acc_rows.append(
                     {
-                        "time": msg_time,
+                        "time": ts,
                         "ACC_X": ax * ACC_SCALE,
                         "ACC_Y": ay * ACC_SCALE,
                         "ACC_Z": az * ACC_SCALE,
                     }
                 )
-                results["GYRO"].append(
+                gyro_rows.append(
                     {
-                        "time": msg_time,
+                        "time": ts,
                         "GYRO_X": gx * GYRO_SCALE,
                         "GYRO_Y": gy * GYRO_SCALE,
                         "GYRO_Z": gz * GYRO_SCALE,
                     }
                 )
+        except struct.error:
+            pass
+        return acc_rows, gyro_rows
 
-    return results
+    # ------------------------------------------------------------------
+    # Decode
+    # ------------------------------------------------------------------
+    acc_rows, gyro_rows = [], []
+
+    for msg in messages:
+        parts = msg.split("\t", 2)
+        if len(parts) != 3:
+            continue
+
+        ts_str, _uuid, hexstr = parts
+
+        # Parse timestamp
+        try:
+            dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            ts = dt.timestamp()
+        except Exception:
+            continue
+
+        # Decode hex payload
+        try:
+            packet = memoryview(bytes.fromhex(hexstr))
+        except Exception:
+            continue
+
+        i = 0
+        n = len(packet)
+        while i < n:
+            tag = packet[i]
+
+            # Skip unrecognised or filler bytes
+            if tag not in PAYLOAD_MAP:
+                i += 1
+                continue
+
+            payload_len = PAYLOAD_MAP[tag]
+            data_start = i + 1 + HEADER_LEN
+            data_end = data_start + payload_len
+
+            # Check bounds
+            if data_end > n:
+                # Incomplete block -> stop scanning this message
+                break
+
+            # Handle ACCGYRO
+            if tag == 0x47:
+                block = bytes(packet[data_start:data_end])
+                acc_blk, gyro_blk = parse_accgyro_block(block, ts)
+                acc_rows.extend(acc_blk)
+                gyro_rows.extend(gyro_blk)
+
+            # Advance index past this full packet
+            i = data_end
+
+    # ------------------------------------------------------------------
+    # Output
+    # ------------------------------------------------------------------
+    out = {}
+    if acc_rows:
+        out["ACC"] = pd.DataFrame(acc_rows).sort_values("time").reset_index(drop=True)
+    if gyro_rows:
+        out["GYRO"] = pd.DataFrame(gyro_rows).sort_values("time").reset_index(drop=True)
+    return out
 
 
 def extract_channels_and_stats(data_dict):
@@ -193,19 +235,16 @@ def main():
 
     # Decode using new method (parse_message first)
     print("\n=== New Method (parse_message + tag search) ===")
-    new_data = decode_accgyro_new_method(messages)
+    new_data = decode_rawdata2(messages)
 
-    # How many ACCGYRO packets
-    num_accgyro_packets = sum(
-        1 for m in messages for p in parse_message(m) if p["pkt_type"] == "ACCGYRO"
-    )
+    # Convert pandas DataFrames to dict format for consistency
+    new_data = {
+        "ACC": new_data["ACC"].to_dict("records") if "ACC" in new_data else [],
+        "GYRO": (new_data["GYRO"].to_dict("records") if "GYRO" in new_data else []),
+    }
 
-    print(
-        f"Decoded {len(new_data['ACC'])} ACC samples (from {num_accgyro_packets} ACCGYRO packets)"
-    )
-    print(
-        f"Decoded {len(new_data['GYRO'])} GYRO samples (from {num_accgyro_packets} ACCGYRO packets)"
-    )
+    print(f"Decoded {len(new_data['ACC'])} ACC samples")
+    print(f"Decoded {len(new_data['GYRO'])} GYRO samples")
 
     # Extract channels and compute statistics
     (

@@ -5,18 +5,6 @@ Muse BLE Message Parser
 Efficiently parses BLE (Bluetooth Low Energy) messages from Muse devices into
 structured packets for downstream signal processing.
 
-Overview:
----------
-Each BLE message contains a hex-enc        >>> from MuseLSL3.decode_new import parse_message
-        >>> message = "2025-10-05T14:06:55.620681+00:00\t...\td700000166..."
-        >>> subpackets = parse_message(message)
-        >>> for sp in subpackets:
-        ...     if sp['pkt_type'] == 'Battery':
-        ...         times, data = sp['pkt_data']
-        ...         print(f"Battery at {times[0]:.3f}s: {data[0]:.2f}%")
-        Battery at 1234.567s: 16.53%load that may contain multiple concatenated
-packets. Each packet has a 14-byte header followed by variable-length sensor data.
-
 Functions:
 ----------
 - parse_message(message: str) -> List[Dict]: Parse BLE message into packets
@@ -43,14 +31,7 @@ Byte Offset | Field Name        | Type      | Description
 Notes & Known Issues:
 ---------------------
 1. TIMESTAMPS NOT STRICTLY MONOTONIC: Device timestamps (pkt_time) are mostly
-   increasing but can occasionally arrive out-of-order (~6% non-monotonic in test data).
-   This is likely due to:
-   - BLE packet transmission timing
-   - Multi-sensor interleaving at device level
-   - Buffering in BLE stack
-
-   Recommendation: When timestamp ordering is critical, use message_time (system
-   timestamp) as primary reference, or implement reordering buffer.
+   increasing but can occasionally arrive out-of-order (to be confirmed).
 
 2. UNKNOWN FIELDS: Bytes 6-8 (pkt_unknown1) and 10-12 (pkt_unknown2) have
    consistent patterns per preset but their exact meaning is not yet decoded. They
@@ -62,21 +43,12 @@ Notes & Known Issues:
 
    These fields are preserved in output for future analysis.
 
-3. COUNTER WRAPPING: Packet counter (pkt_n) wraps from 255 to 0. Applications
-   should handle this wrap-around when detecting dropped packets.
-
 Usage Example:
 --------------
-    from MuseLSL3.decode_new import parse_message
+Example of raw BLE message (2 messages):
 
-    message = "2025-09-25T08:10:06.642793Z\\t273e0013...\\td7..."
-    packets = parse_message(message)
-
-    for pkt in packets:
-        if pkt['pkt_valid']:
-            sensor_type = pkt['pkt_type']
-            raw_data = pkt['pkt_data']
-            # Process sensor-specific data...
+2025-10-05T19:06:25.799053+00:00	273e0013-4c4d-454d-96be-f03bac821358	d700005528d18993014700fe02006ec088fea4039700fb00940076c09bfebe031bfcc901a4fc38c073fe8203e5feb200effe1200733801ff1f0008000280ffdffff7ff0180fcdf0028000e804a2013a8050a801201b0380160e1be77ed097ab09eab27eaed7b77dc6c482e928faa216c681a42871202ce3801fbac6f4545d54817dbc8c6c5b953ff3f000000c8030000001008000012030c3901a956e7e2190ab8d943ad30237c0a00407ffeffffffe57109ecfbc2b5120449390101d1ffcf6663a9ffffffffffffff0c3db0c8988400baac596bedeebc
+2025-10-05T19:06:25.829038+00:00	273e0013-4c4d-454d-96be-f03bac821358	f00100a628d189930112051c0000ff3f0000000000ad005e7027940c6f1a1582d915a3bd00000000000012067a000000805ffdffffff0dedd0eaade2a31bccffefafe7bcffffffffffffff1207980000faf823dae7100eb9f189ac38bfcfff3f0000000000dc0460016ca81d1208d500000da0fab07bed8a00000000000000000044fcffffffbd27789957b68d120912010030c7ff2feb3bcfffffffffffffffebf391fb32f91c4376b23d7f97e0120a4f0100ff7f4d000000007b898a92b8dc2fe6a609e01d756f00000000000000120b6e010000c039dbdfffff392218e8ff117771c3ffffff07dcffffffffffffff
 """
 
 import struct
@@ -107,6 +79,11 @@ TYPE_MAP = {
     7: "ACCGYRO",
     8: "Battery",
 }
+
+# Based on the FREQ/TYPE nibbles, possible ID bytes are: 0x11, 0x12, 0x13, 0x34, 0x35, 0x36, 0x47, 0x98
+
+ACC_SCALE = 0.0000610352
+GYRO_SCALE = -0.0074768
 
 
 def parse_message(message: str) -> List[Dict]:
@@ -196,9 +173,12 @@ def parse_message(message: str) -> List[Dict]:
             and pkt_len >= 14  # Minimum header size
         )
 
+        leftover = None
         # Decode battery percentage if this is a Battery subpacket
         if pkt_valid and pkt_type == "Battery":
-            pkt_data = decode_battery(pkt_data, pkt_time)
+            pkt_data, leftover = decode_battery(pkt_data, pkt_time)
+        if pkt_valid and pkt_type == "ACCGYRO":
+            pkt_data, leftover = decode_accgyro(pkt_data, pkt_time)
 
         # Build subpacket dictionary with only requested fields
         subpkt_dict = {
@@ -214,6 +194,7 @@ def parse_message(message: str) -> List[Dict]:
             "pkt_unknown2": pkt_unknown2,
             "pkt_data": pkt_data,
             "pkt_valid": pkt_valid,
+            "leftover": leftover,
         }
 
         subpackets.append(subpkt_dict)
@@ -224,7 +205,7 @@ def parse_message(message: str) -> List[Dict]:
     return subpackets
 
 
-def decode_battery(pkt_data: bytes, pkt_time: float) -> tuple[np.ndarray, np.ndarray]:
+def decode_battery(pkt_data: bytes, pkt_time: float):
     """
     Decode battery data (battery percentage, 0-100%) from Battery packet.
 
@@ -265,8 +246,51 @@ def decode_battery(pkt_data: bytes, pkt_time: float) -> tuple[np.ndarray, np.nda
     raw_soc = struct.unpack("<H", pkt_data[0:2])[0]
     battery_percent = raw_soc / 256.0
 
-    # Return as (times, data) tuple with single-element arrays
-    times = np.array([pkt_time])
-    data = np.array([battery_percent])
+    # Return as (1 sample of) times, data array
+    data = np.array([pkt_time, battery_percent], dtype=np.float32)
 
-    return times, data
+    leftover = pkt_data[2:]  # leftover bytes undecoded
+
+    return data, leftover
+
+
+def decode_accgyro(pkt_data: bytes, pkt_time: float):
+
+    bytes_needed = 36  # 18 int16 values
+    if bytes_needed > len(pkt_data):
+        return np.empty((0, 7), dtype=np.float32), pkt_data
+
+    block = pkt_data[0:bytes_needed]
+
+    # interpret 18 int16 values → reshape to 3 samples × 6 channels
+    data = np.frombuffer(block, dtype="<i2", count=18).reshape(-1, 6)
+    data = data.astype(np.float32)
+
+    # apply scaling: first 3 cols (ACC), next 3 cols (GYRO)
+    data[:, 0:3] *= ACC_SCALE
+    data[:, 3:6] *= GYRO_SCALE
+
+    # Add a back-filled time vector according to 52 Hz sampling rate
+    num_samples = data.shape[0]
+    times = pkt_time - (num_samples - 1) * (1 / 52) + np.arange(num_samples) * (1 / 52)
+
+    # Add times as the first column
+    data = np.hstack((times.astype(np.float32).reshape(-1, 1), data))
+
+    leftover = pkt_data[bytes_needed:]  # leftover bytes undecoded
+
+    return data, leftover
+
+
+# with open("../tests/test_data/test_accgyro.txt", "r", encoding="utf-8") as f:
+#     messages = f.readlines()
+# pkts = [parse_message(m) for m in messages]
+# print(f"Total packets: {len(pkts)}")
+# accgyro = [p for sublist in pkts for p in sublist if p["pkt_type"] == "ACCGYRO"]
+# data = np.vstack([a["pkt_data"] for a in accgyro if a["pkt_valid"]])
+# data = pd.DataFrame(
+#     data, columns=["time", "ACC_X", "ACC_Y", "ACC_Z", "GYRO_X", "GYRO_Y", "GYRO_Z"]
+# )
+
+# data.plot(x="time", y=["ACC_X", "ACC_Y", "ACC_Z", "GYRO_X", "GYRO_Y", "GYRO_Z"], subplots=True)
+# leftovers = [a["leftover"] for a in accgyro if a["pkt_valid"] and a["leftover"]]
