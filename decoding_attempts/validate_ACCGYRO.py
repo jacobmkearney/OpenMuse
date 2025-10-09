@@ -49,5 +49,6 @@ if accgyro_data:
         title="ACCGYRO Data",
     )
     print(f"ACCGYRO samples: {len(accgyro)}")
+    print(f"Effective ACCGYRO sampling rate: {len(accgyro) / 90:.2f} Hz")
 else:
     print("No ACCGYRO data found")

@@ -181,62 +181,62 @@ def parse_message(message: str) -> List[Dict]:
             d, leftover = decode_accgyro(pkt_data, pkt_time)
             data_accgyro.append(d)
 
-        # Parse leftovers for additional sensor data
-        # Leftovers can contain additional sensor packets with structure: TAG byte followed immediately by data
-        # Only parse ACCGYRO for now, as Battery structure in leftovers is less clear
-        if leftover is not None and len(leftover) > 0:
-            offset_leftover = 0
-            while offset_leftover < len(leftover):
-                # Look for ACCGYRO tag (0x47)
-                if leftover[offset_leftover] == 0x47:
-                    # ACCGYRO data is 36 bytes (3 samples × 6 channels × 2 bytes)
-                    if offset_leftover + 1 + 36 <= len(leftover):
-                        accgyro_data_bytes = leftover[
-                            offset_leftover + 1 : offset_leftover + 1 + 36
-                        ]
+        # # Parse leftovers for additional sensor data
+        # # Leftovers can contain additional sensor packets with structure: TAG byte followed immediately by data
+        # # Only parse ACCGYRO for now, as Battery structure in leftovers is less clear
+        # if leftover is not None and len(leftover) > 0:
+        #     offset_leftover = 0
+        #     while offset_leftover < len(leftover):
+        #         # Look for ACCGYRO tag (0x47)
+        #         if leftover[offset_leftover] == 0x47:
+        #             # ACCGYRO data is 36 bytes (3 samples × 6 channels × 2 bytes)
+        #             if offset_leftover + 1 + 36 <= len(leftover):
+        #                 accgyro_data_bytes = leftover[
+        #                     offset_leftover + 1 : offset_leftover + 1 + 36
+        #                 ]
 
-                        # Decode ACCGYRO data
-                        data = np.frombuffer(
-                            accgyro_data_bytes, dtype="<i2", count=18
-                        ).reshape(-1, 6)
-                        data = data.astype(np.float32)
+        #                 # Decode ACCGYRO data
+        #                 data = np.frombuffer(
+        #                     accgyro_data_bytes, dtype="<i2", count=18
+        #                 ).reshape(-1, 6)
+        #                 data = data.astype(np.float32)
 
-                        # Apply scaling
-                        data[:, 0:3] *= ACC_SCALE
-                        data[:, 3:6] *= GYRO_SCALE
+        #                 # Apply scaling
+        #                 data[:, 0:3] *= ACC_SCALE
+        #                 data[:, 3:6] *= GYRO_SCALE
 
-                        # Validate that the data looks reasonable (sanity check)
-                        # ACC should be roughly -20 to 20 m/s^2, GYRO roughly -10 to 10 rad/s
-                        acc_reasonable = np.all(
-                            (data[:, :3] > -50) & (data[:, :3] < 50)
-                        )
-                        gyro_reasonable = np.all(
-                            (data[:, 3:] > -50) & (data[:, 3:] < 50)
-                        )
+        #                 # Validate that the data looks reasonable (sanity check)
+        #                 # ACC should be roughly -20 to 20 m/s^2, GYRO roughly -10 to 10 rad/s
+        #                 acc_reasonable = np.all(
+        #                     (data[:, :3] > -50) & (data[:, :3] < 50)
+        #                 )
+        #                 gyro_reasonable = np.all(
+        #                     (data[:, 3:] > -50) & (data[:, 3:] < 50)
+        #                 )
 
-                        if acc_reasonable and gyro_reasonable:
-                            # Add back-filled time vector (52 Hz sampling rate)
-                            num_samples = data.shape[0]
-                            times = (
-                                pkt_time
-                                - (num_samples - 1) * (1 / 52)
-                                + np.arange(num_samples) * (1 / 52)
-                            )
-                            data = np.hstack(
-                                (times.astype(np.float32).reshape(-1, 1), data)
-                            )
+        #                 if acc_reasonable and gyro_reasonable:
+        #                     # Add back-filled time vector (52 Hz sampling rate)
+        #                     num_samples = data.shape[0]
+        #                     times = (
+        #                         pkt_time
+        #                         - (num_samples - 1) * (1 / 52)
+        #                         + np.arange(num_samples) * (1 / 52)
+        #                     )
+        #                     data = np.hstack(
+        #                         (times.astype(np.float32).reshape(-1, 1), data)
+        #                     )
 
-                            data_accgyro.append(data)
-                            offset_leftover += 1 + 36
-                        else:
-                            # Data doesn't look valid, skip this byte
-                            offset_leftover += 1
-                    else:
-                        break
+        #                     data_accgyro.append(data)
+        #                     offset_leftover += 1 + 36
+        #                 else:
+        #                     # Data doesn't look valid, skip this byte
+        #                     offset_leftover += 1
+        #             else:
+        #                 break
 
-                else:
-                    # Not a recognized tag, move to next byte
-                    offset_leftover += 1
+        #         else:
+        #             # Not a recognized tag, move to next byte
+        #             offset_leftover += 1
 
         # Build subpacket dictionary with only requested fields
         subpkt_dict = {
