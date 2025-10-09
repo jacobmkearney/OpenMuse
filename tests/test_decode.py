@@ -9,7 +9,7 @@ import os
 import struct
 import numpy as np
 from datetime import datetime
-from MuseLSL3.decode_new import parse_message, decode_battery, FREQ_MAP, TYPE_MAP
+from MuseLSL3.decode import parse_message, decode_battery, FREQ_MAP, TYPE_MAP
 
 
 class TestParseMessage(unittest.TestCase):
@@ -72,8 +72,10 @@ class TestParseMessage(unittest.TestCase):
             "pkt_freq",
             "pkt_type",
             "pkt_unknown2",
-            "pkt_data",
             "pkt_valid",
+            "leftover",
+            "data_accgyro",
+            "data_battery",
         }
         self.assertEqual(set(subpkt.keys()), required_fields)
 
@@ -97,8 +99,11 @@ class TestParseMessage(unittest.TestCase):
         self.assertIn(type(subpkt["pkt_type"]), [str, type(None)])
         self.assertIsInstance(subpkt["pkt_unknown2"], bytes)
         self.assertIsInstance(subpkt["pkt_valid"], bool)
-        # pkt_data can be bytes (raw) or tuple (decoded)
-        self.assertIn(type(subpkt["pkt_data"]), [bytes, tuple])
+        # leftover is bytes (undecoded data)
+        self.assertIn(type(subpkt["leftover"]), [bytes, type(None)])
+        # data_accgyro and data_battery are lists
+        self.assertIsInstance(subpkt["data_accgyro"], list)
+        self.assertIsInstance(subpkt["data_battery"], list)
 
     def test_field_constraints(self):
         """Test that fields meet expected constraints."""
@@ -462,7 +467,7 @@ class TestParseMessage(unittest.TestCase):
                     )
 
     def test_data_section_length(self):
-        """Test that data section length matches expected size."""
+        """Test that Battery and ACCGYRO packets have their data decoded."""
         with open(self.test_files["p20"], "r", encoding="utf-8") as f:
             message = f.readline()
 
@@ -471,15 +476,19 @@ class TestParseMessage(unittest.TestCase):
             if not subpkt["pkt_valid"]:
                 continue
 
-            # Data length should be pkt_len - 14 (header size)
-            expected_data_len = subpkt["pkt_len"] - 14
-            actual_data_len = len(subpkt["pkt_data"])
-
-            self.assertEqual(
-                actual_data_len,
-                expected_data_len,
-                f"Data length mismatch: expected {expected_data_len}, got {actual_data_len}",
-            )
+            # Battery and ACCGYRO packets should have data decoded
+            if subpkt["pkt_type"] == "Battery":
+                self.assertGreater(
+                    len(subpkt["data_battery"]),
+                    0,
+                    "Battery packet should have data_battery populated",
+                )
+            elif subpkt["pkt_type"] == "ACCGYRO":
+                self.assertGreater(
+                    len(subpkt["data_accgyro"]),
+                    0,
+                    "ACCGYRO packet should have data_accgyro populated",
+                )
 
 
 class TestLookupTables(unittest.TestCase):
@@ -586,10 +595,10 @@ class TestDecodeBattery(unittest.TestCase):
                 for message in messages:
                     subpackets = parse_message(message)
                     for sp in subpackets:
-                        if sp["pkt_type"] == "Battery":
-                            times, data = sp["pkt_data"]
-                            # times and data are single-element arrays
-                            battery_data.append((times[0], data[0]))
+                        if sp["pkt_type"] == "Battery" and sp["data_battery"]:
+                            # data_battery is a list of numpy arrays [time, battery_percent]
+                            for bat_array in sp["data_battery"]:
+                                battery_data.append((bat_array[0], bat_array[1]))
 
                 if len(battery_data) < 2:
                     # Skip files without sufficient battery data
@@ -644,11 +653,10 @@ class TestDecodeBattery(unittest.TestCase):
                 for message in messages:
                     subpackets = parse_message(message)
                     for sp in subpackets:
-                        if sp["pkt_type"] == "Battery":
-                            times, data = sp["pkt_data"]
-                            battery_values.append(
-                                data[0]
-                            )  # data is single-element array
+                        if sp["pkt_type"] == "Battery" and sp["data_battery"]:
+                            # data_battery is a list of numpy arrays [time, battery_percent]
+                            for bat_array in sp["data_battery"]:
+                                battery_values.append(bat_array[1])
 
                 # Verify we found battery packets
                 self.assertGreater(
@@ -668,4 +676,3 @@ class TestDecodeBattery(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
-

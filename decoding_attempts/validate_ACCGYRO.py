@@ -9,23 +9,45 @@ with open("../tests/test_data/test_accgyro.txt", "r", encoding="utf-8") as f:
 packets = [parse_message(m) for m in messages]
 print(f"Total packets: {len(packets)}")
 
-battery = [
-    p["data_battery"] for pkt in packets for p in pkt if p["pkt_type"] == "Battery"
-]
-battery = np.concatenate(battery)
-battery = pd.DataFrame(battery, columns=["time", "battery_percent"])
-battery.plot(x="time", y="battery_percent")
+# Extract battery data - now each packet can have multiple battery readings
+battery_data = []
+for pkt in packets:
+    for p in pkt:
+        if p["pkt_type"] == "Battery" and p["data_battery"]:
+            # Each data_battery element is a 1D array [time, battery_percent]
+            for bat_reading in p["data_battery"]:
+                battery_data.append(bat_reading)
 
+if battery_data:
+    battery = np.array(battery_data)
+    battery = pd.DataFrame(battery, columns=["time", "battery_percent"])
+    battery.plot(x="time", y="battery_percent", title="Battery Level")
+    print(f"Battery readings: {len(battery)}")
+else:
+    print("No battery data found")
 
-accgyro = [
-    p["data_accgyro"] for pkt in packets for p in pkt if p["pkt_type"] == "ACCGYRO"
-]
-accgyro = np.concatenate(accgyro, axis=1)[0, :, :]
-accgyro = pd.DataFrame(
-    accgyro, columns=["time", "ACC_X", "ACC_Y", "ACC_Z", "GYRO_X", "GYRO_Y", "GYRO_Z"]
-)
-accgyro.plot(
-    x="time", y=["ACC_X", "ACC_Y", "ACC_Z", "GYRO_X", "GYRO_Y", "GYRO_Z"], subplots=True
-)
+# Extract ACCGYRO data - now each packet can have multiple ACCGYRO arrays
+accgyro_data = []
+for pkt in packets:
+    for p in pkt:
+        if p["pkt_type"] == "ACCGYRO" and p["data_accgyro"]:
+            # Each data_accgyro element is a 2D array (3 samples, 7 columns)
+            for acc_array in p["data_accgyro"]:
+                accgyro_data.append(acc_array)
 
-leftovers = [a["leftover"] for a in accgyro if a["pkt_valid"] and a["leftover"]]
+if accgyro_data:
+    # Concatenate all arrays vertically (stack samples)
+    accgyro = np.vstack(accgyro_data)
+    accgyro = pd.DataFrame(
+        accgyro,
+        columns=["time", "ACC_X", "ACC_Y", "ACC_Z", "GYRO_X", "GYRO_Y", "GYRO_Z"],
+    )
+    accgyro.plot(
+        x="time",
+        y=["ACC_X", "ACC_Y", "ACC_Z", "GYRO_X", "GYRO_Y", "GYRO_Z"],
+        subplots=True,
+        title="ACCGYRO Data",
+    )
+    print(f"ACCGYRO samples: {len(accgyro)}")
+else:
+    print("No ACCGYRO data found")
