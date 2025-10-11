@@ -35,18 +35,29 @@ async def _record_async(
     except Exception:
         pass
 
-    # Open output file in text mode and append
-    f = open(outfile, "a", encoding="utf-8")
+    # Open output file (text or binary) and append
+    is_binary = outfile.lower().endswith(".bin")
+    if is_binary:
+        f = open(outfile, "ab")
+    else:
+        f = open(outfile, "a", encoding="utf-8")
 
     # Raw recording only
     def _callback(uuid: str):
         def inner(_, data: bytearray):
             nonlocal notified
             notified += 1
-            # Log timestamp, char UUID, and hex payload
-            ts = _ts()
-            line = f"{ts}\t{uuid}\t{data.hex()}\n"
-            f.write(line)
+            if is_binary:
+                # Write raw payload bytes directly
+                try:
+                    f.write(bytes(data))
+                except Exception:
+                    pass
+            else:
+                # Log timestamp, char UUID, and hex payload (text mode)
+                ts = _ts()
+                line = f"{ts}\t{uuid}\t{data.hex()}\n"
+                f.write(line)
             # Raw recording only; no decoding or viewing
             if not stream_started.is_set():
                 stream_started.set()

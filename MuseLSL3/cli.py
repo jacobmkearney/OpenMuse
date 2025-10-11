@@ -31,10 +31,10 @@ def main(argv=None):
 
     # record subcommand
     p_rec = subparsers.add_parser(
-        "record", help="Connect and record raw packets to a text file"
+        "record", help="Connect and record raw packets to a file (text or .bin)"
     )
     p_rec.add_argument(
-        "--address", required=True, help="Device address (e.g., MAC on Windows)"
+        "--address", required=False, help="Device address; omit to auto-discover"
     )
     p_rec.add_argument(
         "--duration",
@@ -53,8 +53,16 @@ def main(argv=None):
     def handle_record(ns):
         if ns.duration <= 0:
             parser.error("--duration must be positive")
+        # Auto-discover address if not provided
+        address = ns.address
+        if not address:
+            found = find_devices(timeout=10, verbose=True)
+            if not found:
+                parser.error("No Muse devices discovered. Ensure headset is on and in range.")
+            address = found[0]["address"]
+            print(f"Using discovered device address: {address}")
         record(
-            address=ns.address,
+            address=address,
             duration=ns.duration,
             outfile=ns.outfile,
             preset=ns.preset,
