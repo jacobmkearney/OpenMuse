@@ -9,7 +9,7 @@ import bleak
 import numpy as np
 
 from .backends import _run
-from .decode import decode_message
+from .decode import parse_message
 from .muse import MuseS
 
 from mne_lsl.lsl import StreamInfo, StreamOutlet
@@ -72,21 +72,19 @@ async def _stream_async(
         try:
             # ACC/GYRO data comes through EEG characteristic, not OTHER
             message = f"{_ts()}\t{MuseS.EEG_UUID}\t{data.hex()}"
-            decoded = decode_message(message)
+            decoded = parse_message(message)
         except Exception as exc:
             if verbose:
                 print(f"Decoding error: {exc}")
             return
 
-        if not decoded:
+        # Get ACCGYRO data (numpy array with shape (n_samples, 7): time + 6 channels)
+        accgyro_data = decoded.get("ACCGYRO", np.empty((0, 0)))
+
+        if accgyro_data.size == 0:
             return
 
-        # Combine ACC and GYRO data into 6-channel samples
-        acc_entries = decoded.get("ACC", [])
-        gyro_entries = decoded.get("GYRO", [])
-
-        # ACC and GYRO should have the same number of samples
-        num_samples = min(len(acc_entries), len(gyro_entries))
+        num_samples = accgyro_data.shape[0]
 
         # Get LSL timestamp for this BLE packet to establish device-to-LSL time mapping
         from mne_lsl.lsl import local_clock
@@ -97,18 +95,19 @@ async def _stream_async(
         # This maps device time (device uptime in seconds) to LSL time
         device_to_lsl_offset = 0.0  # Initialize default offset
         if num_samples > 0:
-            device_time_first = acc_entries[0].get("time", None)
-            if device_time_first is not None:
-                # Calculate offset: LSL_time = device_time + offset
-                device_to_lsl_offset = lsl_now - device_time_first
+            device_time_first = accgyro_data[0, 0]  # First column is time
+            # Calculate offset: LSL_time = device_time + offset
+            device_to_lsl_offset = lsl_now - device_time_first
 
         for i in range(num_samples):
-            acc_x = acc_entries[i].get("ACC_X", 0.0)
-            acc_y = acc_entries[i].get("ACC_Y", 0.0)
-            acc_z = acc_entries[i].get("ACC_Z", 0.0)
-            gyro_x = gyro_entries[i].get("GYRO_X", 0.0)
-            gyro_y = gyro_entries[i].get("GYRO_Y", 0.0)
-            gyro_z = gyro_entries[i].get("GYRO_Z", 0.0)
+            # Extract data: columns are [time, ACC_X, ACC_Y, ACC_Z, GYRO_X, GYRO_Y, GYRO_Z]
+            device_time = accgyro_data[i, 0]
+            acc_x = accgyro_data[i, 1]
+            acc_y = accgyro_data[i, 2]
+            acc_z = accgyro_data[i, 3]
+            gyro_x = accgyro_data[i, 4]
+            gyro_y = accgyro_data[i, 5]
+            gyro_z = accgyro_data[i, 6]
 
             sample = np.array(
                 [acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z],
@@ -116,15 +115,9 @@ async def _stream_async(
             )
 
             # Use actual device timestamp for LSL timestamp
-            lsl_timestamp = None
             try:
-                device_time = acc_entries[i].get("time", None)
-                if device_time is not None:
-                    # Convert device time to LSL time using the offset
-                    lsl_timestamp = device_time + device_to_lsl_offset
-                else:
-                    # Fallback to current LSL time if device time is missing
-                    lsl_timestamp = local_clock()
+                # Convert device time to LSL time using the offset
+                lsl_timestamp = device_time + device_to_lsl_offset
 
                 outlet.push_sample(sample, lsl_timestamp)
                 samples_sent += 1
@@ -138,23 +131,16 @@ async def _stream_async(
             # Accumulate data for JSON if requested
             if json_data is not None:
                 try:
-                    ts = acc_entries[i].get("time")
-                    # ts is already a float (seconds since epoch) from decode_message
-                    ts_float = ts if ts is not None else time.time()
-                    json_data["ACC"]["time"].append(ts_float)
-                    json_data["ACC"]["time_lsl"].append(
-                        lsl_timestamp if lsl_timestamp else 0.0
-                    )
-                    json_data["ACC"]["ACC_X"].append(acc_x)
-                    json_data["ACC"]["ACC_Y"].append(acc_y)
-                    json_data["ACC"]["ACC_Z"].append(acc_z)
-                    json_data["GYRO"]["time"].append(ts_float)
-                    json_data["GYRO"]["time_lsl"].append(
-                        lsl_timestamp if lsl_timestamp else 0.0
-                    )
-                    json_data["GYRO"]["GYRO_X"].append(gyro_x)
-                    json_data["GYRO"]["GYRO_Y"].append(gyro_y)
-                    json_data["GYRO"]["GYRO_Z"].append(gyro_z)
+                    json_data["ACC"]["time"].append(float(device_time))
+                    json_data["ACC"]["time_lsl"].append(float(lsl_timestamp))
+                    json_data["ACC"]["ACC_X"].append(float(acc_x))
+                    json_data["ACC"]["ACC_Y"].append(float(acc_y))
+                    json_data["ACC"]["ACC_Z"].append(float(acc_z))
+                    json_data["GYRO"]["time"].append(float(device_time))
+                    json_data["GYRO"]["time_lsl"].append(float(lsl_timestamp))
+                    json_data["GYRO"]["GYRO_X"].append(float(gyro_x))
+                    json_data["GYRO"]["GYRO_Y"].append(float(gyro_y))
+                    json_data["GYRO"]["GYRO_Z"].append(float(gyro_z))
                     samples_written += 1
                 except Exception as exc:
                     if verbose:
