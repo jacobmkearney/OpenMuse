@@ -8,8 +8,14 @@ structured packets for downstream signal processing.
 Functions:
 ----------
 - parse_message(message: str) -> List[Dict]: Parse BLE message into packets
-- decode_battery(pkt_data: bytes, pkt_time: float) -> tuple[np.ndarray, np.ndarray]:
-    Extract battery percentage from packet data, returns (times, data) arrays
+- decode_battery(pkt_data: bytes, pkt_time: float) -> tuple[np.ndarray, bytes]:
+    Extract battery percentage from packet data
+- decode_eeg(pkt_data: bytes, pkt_time: float, n_channels: int) -> tuple[np.ndarray, bytes]:
+    Decode EEG4/EEG8 data with 14-bit precision
+- decode_accgyro(pkt_data: bytes, pkt_time: float) -> tuple[np.ndarray, bytes]:
+    Decode accelerometer and gyroscope data
+- decode_optics(pkt_data: bytes, pkt_time: float, n_channels: int) -> tuple[np.ndarray, bytes]:
+    Decode Optics4/Optics8/Optics16 data with 20-bit precision
 
 
 Packet Structure:
@@ -177,6 +183,7 @@ def parse_message(message: str, parse_leftovers=True) -> List[Dict]:
 
         data_accgyro = []
         data_battery = []
+        data_eeg = []
         data_optics = []
 
         # Parse primary data
@@ -186,6 +193,10 @@ def parse_message(message: str, parse_leftovers=True) -> List[Dict]:
         if pkt_valid and pkt_type == "ACCGYRO":
             d, leftover = decode_accgyro(pkt_data, pkt_time)
             data_accgyro.append(d)
+        if pkt_valid and pkt_type in ["EEG4", "EEG8"]:
+            n_channels = 4 if pkt_type == "EEG4" else 8
+            d, leftover = decode_eeg(pkt_data, pkt_time, n_channels)
+            data_eeg.append(d)
         if pkt_valid and pkt_type in ["Optics4", "Optics8", "Optics16"]:
             n_channels = (
                 4 if pkt_type == "Optics4" else 8 if pkt_type == "Optics8" else 16
@@ -265,6 +276,7 @@ def parse_message(message: str, parse_leftovers=True) -> List[Dict]:
             "leftover": leftover,
             "data_accgyro": data_accgyro,
             "data_battery": data_battery,
+            "data_eeg": data_eeg,
             "data_optics": data_optics,
         }
 
@@ -323,6 +335,113 @@ def decode_battery(pkt_data: bytes, pkt_time: float):
     # Leftover starts at offset 20 (skip 2 bytes battery data + 18 bytes header/metadata)
     # This makes Battery leftovers consistent with ACCGYRO: leftover[0] is a TAG byte
     leftover = pkt_data[20:] if len(pkt_data) > 20 else b""
+
+    return data, leftover
+
+
+def decode_eeg(pkt_data: bytes, pkt_time: float, n_channels: int):
+    """
+    Decode EEG data from EEG4 or EEG8 packet.
+
+    EEG packets contain a variable number of samples of n-channel EEG data,
+    where each value is encoded as a 14-bit unsigned integer.
+
+    Data Format:
+    ------------
+    - Each sample contains n_channels × 14-bit values
+    - Bits are packed in little-endian bit order (LSB-first)
+    - Sampling rate: 256 Hz
+
+    Supported Configurations:
+    -------------------------
+    - EEG4: 4 channels, 4 samples/packet, 28 bytes (224 bits)
+    - EEG8: 8 channels, 2 samples/packet, 28 bytes (224 bits)
+
+    Note: Different EEG modes bundle different numbers of samples per packet.
+    More channels → fewer samples per packet (to keep packet size constant at 28 bytes).
+
+    Scaling:
+    --------
+    - Raw 14-bit unsigned integers (range 0-16383) are scaled by (1450 / 16383)
+    - This converts to microvolts (µV)
+
+    Timing:
+    -------
+    - Samples are back-filled from pkt_time at 256 Hz sampling rate
+    - Sample times calculated based on n_samples per packet
+
+    Parameters:
+    -----------
+    pkt_data : bytes
+        Raw packet data containing EEG sensor values
+    pkt_time : float
+        Packet timestamp (seconds)
+    n_channels : int
+        Number of EEG channels (4 or 8)
+
+    Returns:
+    --------
+    data : np.ndarray, shape (n_samples, n_channels + 1)
+        Array with columns: [time, EEG_01, EEG_02, ..., EEG_N]
+        Values are in microvolts (µV)
+    leftover : bytes
+        Remaining unparsed bytes after primary EEG data
+    """
+    # Infer number of samples per packet based on channel count
+    # Validated via leftover TAG analysis (100% validation across all test files)
+    if n_channels == 4:
+        n_samples = 4  # EEG4: 4 samples × 4 channels × 14 bits = 28 bytes
+    elif n_channels == 8:
+        n_samples = 2  # EEG8: 2 samples × 8 channels × 14 bits = 28 bytes
+    else:
+        raise ValueError(f"Unsupported n_channels: {n_channels}. Expected 4 or 8.")
+
+    # Calculate required bytes: n_samples × n_channels × 14 bits / 8 bits per byte
+    bits_needed = n_samples * n_channels * 14
+    bytes_needed = bits_needed // 8
+
+    if bytes_needed > len(pkt_data):
+        return np.empty((0, n_channels + 1), dtype=np.float32), pkt_data
+
+    block = pkt_data[0:bytes_needed]
+
+    # Convert bytes to bit array (LSB first within each byte)
+    bits = []
+    for byte in block:
+        for bit_pos in range(8):
+            bits.append((byte >> bit_pos) & 1)
+
+    # Parse n_samples samples, each with n_channels × 14-bit values
+    data = np.zeros((n_samples, n_channels), dtype=np.float32)
+
+    for sample_idx in range(n_samples):
+        for channel_idx in range(n_channels):
+            # Calculate bit position for this value
+            bit_start = (sample_idx * n_channels + channel_idx) * 14
+            bit_end = bit_start + 14
+
+            # Extract 14 bits and convert to integer (little-endian bit order)
+            int_value = 0
+            for bit_idx in range(14):
+                if bits[bit_start + bit_idx]:
+                    int_value |= 1 << bit_idx
+
+            # Scale and store (convert to microvolts)
+            data[sample_idx, channel_idx] = int_value * (1450.0 / 16383.0)
+
+    # Add back-filled time vector at 256 Hz sampling rate
+    sampling_rate = 256.0
+    times = (
+        pkt_time
+        - (n_samples - 1) * (1 / sampling_rate)
+        + np.arange(n_samples) * (1 / sampling_rate)
+    )
+
+    # Add times as the first column (keep as float64 for precision with large timestamps)
+    times_col = times.reshape(-1, 1).astype(np.float64)
+    data = np.hstack((times_col, data))
+
+    leftover = pkt_data[bytes_needed:]
 
     return data, leftover
 
@@ -388,21 +507,23 @@ def decode_optics(pkt_data: bytes, pkt_time: float, n_channels: int):
     """
     Decode optical sensor data from OPTICS packet.
 
-    OPTICS packets contain 3 samples of n-channel optical data, where each value
-    is encoded as a 20-bit unsigned integer.
+    OPTICS packets contain a variable number of samples of n-channel optical data,
+    where each value is encoded as a 20-bit unsigned integer.
 
     Data Format:
     ------------
     - Each sample contains n_channels × 20-bit values
-    - Total bits per packet: 3 samples × n_channels × 20 bits
     - Bits are packed in little-endian byte order
     - Each 20-bit value spans across bytes with LSB first
 
     Supported Configurations:
     -------------------------
-    - Optics4:  4 channels, 64 Hz sampling rate, 30 bytes (480 bits)
-    - Optics8:  8 channels, 64 Hz sampling rate, 60 bytes (960 bits)
-    - Optics16: 16 channels, 64 Hz sampling rate, 120 bytes (1920 bits)
+    - Optics4:  4 channels, 3 samples/packet, 30 bytes (240 bits)
+    - Optics8:  8 channels, 2 samples/packet, 40 bytes (320 bits)
+    - Optics16: 16 channels, 1 sample/packet, 40 bytes (320 bits)
+
+    Note: Different optics modes bundle different numbers of samples per packet.
+    More channels → fewer samples per packet (to keep packet size manageable).
 
     Scaling:
     --------
@@ -410,8 +531,8 @@ def decode_optics(pkt_data: bytes, pkt_time: float, n_channels: int):
 
     Timing:
     -------
-    - Samples are back-filled from pkt_time at the specified sampling rate
-    - For 64 Hz: Sample times are [pkt_time - 2/64, pkt_time - 1/64, pkt_time]
+    - Samples are back-filled from pkt_time at the inferred sampling rate
+    - Sample times calculated based on n_samples per packet
 
     Parameters:
     -----------
@@ -424,13 +545,24 @@ def decode_optics(pkt_data: bytes, pkt_time: float, n_channels: int):
 
     Returns:
     --------
-    data : np.ndarray, shape (3, n_channels + 1)
+    data : np.ndarray, shape (n_samples, n_channels + 1)
         Array with columns: [time, OPTICS_01, OPTICS_02, ..., OPTICS_N]
     leftover : bytes
         Remaining unparsed bytes after primary OPTICS data
     """
-    # Calculate required bytes: 3 samples × n_channels × 20 bits / 8 bits per byte
-    bits_needed = 3 * n_channels * 20
+    # Infer number of samples per packet based on channel count
+    # Validated via leftover TAG analysis (100% validation across all test files)
+    if n_channels == 4:
+        n_samples = 3  # Optics4: 3 samples × 4 channels × 20 bits = 30 bytes
+    elif n_channels == 8:
+        n_samples = 2  # Optics8: 2 samples × 8 channels × 20 bits = 40 bytes
+    elif n_channels == 16:
+        n_samples = 1  # Optics16: 1 sample × 16 channels × 20 bits = 40 bytes
+    else:
+        raise ValueError(f"Unsupported n_channels: {n_channels}. Expected 4, 8, or 16.")
+
+    # Calculate required bytes: n_samples × n_channels × 20 bits / 8 bits per byte
+    bits_needed = n_samples * n_channels * 20
     bytes_needed = bits_needed // 8
 
     if bytes_needed > len(pkt_data):
@@ -444,10 +576,10 @@ def decode_optics(pkt_data: bytes, pkt_time: float, n_channels: int):
         for bit_pos in range(8):
             bits.append((byte >> bit_pos) & 1)
 
-    # Parse 3 samples, each with n_channels × 20-bit values
-    data = np.zeros((3, n_channels), dtype=np.float32)
+    # Parse n_samples samples, each with n_channels × 20-bit values
+    data = np.zeros((n_samples, n_channels), dtype=np.float32)
 
-    for sample_idx in range(3):
+    for sample_idx in range(n_samples):
         for channel_idx in range(n_channels):
             # Calculate bit position for this value
             bit_start = (sample_idx * n_channels + channel_idx) * 20
@@ -462,10 +594,14 @@ def decode_optics(pkt_data: bytes, pkt_time: float, n_channels: int):
             # Scale and store
             data[sample_idx, channel_idx] = int_value * OPTICS_SCALE
 
-    # Add back-filled time vector according to sampling rate (64 Hz)
-    num_samples = 3
+    # Add back-filled time vector
+    # Use a nominal sampling rate estimate based on observed packet rates
+    # (Actual rates vary by optics mode but this provides reasonable timestamps)
+    sampling_rate = 64.0  # Nominal rate for time interpolation
     times = (
-        pkt_time - (num_samples - 1) * (1 / 64.0) + np.arange(num_samples) * (1 / 64.0)
+        pkt_time
+        - (n_samples - 1) * (1 / sampling_rate)
+        + np.arange(n_samples) * (1 / sampling_rate)
     )
 
     # Add times as the first column (keep as float64 for precision with large timestamps)

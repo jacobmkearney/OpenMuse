@@ -76,6 +76,8 @@ class TestParseMessage(unittest.TestCase):
             "leftover",
             "data_accgyro",
             "data_battery",
+            "data_eeg",
+            "data_optics",
         }
         self.assertEqual(set(subpkt.keys()), required_fields)
 
@@ -489,6 +491,195 @@ class TestParseMessage(unittest.TestCase):
                     0,
                     "ACCGYRO packet should have data_accgyro populated",
                 )
+
+    def test_leftover_tag_validation_all_files(self):
+        """Test that ALL leftovers start with a valid TAG across ALL test files.
+
+        This comprehensive validation ensures that all decoder implementations
+        (EEG4, EEG8, Optics4, Optics8, Optics16, ACCGYRO, Battery, REF)
+        correctly consume the exact number of bytes, leaving valid packet
+        boundaries in the leftover data.
+
+        A leftover's first byte must be a valid TAG (packet type identifier).
+        If not, it indicates incorrect byte consumption by a decoder.
+
+        Method: For each packet, we check if pkt_data[bytes_consumed] is a valid TAG,
+        where bytes_consumed is determined by the packet type's decoder structure:
+        - EEG4: 28 bytes (4 samples × 4 channels × 14 bits)
+        - EEG8: 28 bytes (2 samples × 8 channels × 14 bits)
+        - Optics4: 30 bytes (3 samples × 4 channels × 20 bits)
+        - Optics8: 40 bytes (2 samples × 8 channels × 20 bits)
+        - Optics16: 40 bytes (1 sample × 16 channels × 20 bits)
+        - ACCGYRO: 36 bytes (3 samples × 6 channels × 16 bits)
+        - Battery: 2 bytes (1 sample × 2 values × 8 bits)
+        """
+        # Import TAGS dictionary from decode module
+        from MuseLSL3.decode import TAGS
+
+        # Define bytes consumed by each packet type
+        BYTES_CONSUMED = {
+            "EEG4": 28,
+            "EEG8": 28,
+            "Optics4": 30,
+            "Optics8": 40,
+            "Optics16": 40,
+            "ACCGYRO": 36,
+            "Battery": 20,  # 2 bytes SOC + 18 bytes metadata
+            # REF packets don't have decoders yet, skip them
+        }
+
+        # Statistics tracking
+        total_packets = 0
+        packets_with_leftovers = 0
+        valid_leftovers = 0
+        invalid_leftovers_by_file = {}
+
+        # Process all test files
+        for preset, filepath in self.test_files.items():
+            with self.subTest(preset=preset):
+                with open(filepath, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+
+                file_total_packets = 0
+                file_with_leftovers = 0
+                file_valid = 0
+                invalid_examples = []
+
+                for line_num, message in enumerate(lines, start=1):
+                    if not message.strip():
+                        continue
+
+                    # Parse message to extract packets
+                    try:
+                        ts, uuid, hexstring = message.strip().split("\t", 2)
+                        payload = bytes.fromhex(hexstring.strip())
+                    except (ValueError, AttributeError):
+                        continue
+
+                    offset = 0
+                    while offset < len(payload):
+                        # Need at least 14 bytes for header
+                        if offset + 14 > len(payload):
+                            break
+
+                        # Read declared length
+                        declared_len = payload[offset]
+
+                        # Check if we have enough bytes for the full packet
+                        if offset + declared_len > len(payload):
+                            break
+
+                        # Extract the full packet
+                        pkt = payload[offset : offset + declared_len]
+
+                        # Parse packet type
+                        pkt_id = pkt[9]
+                        type_code = pkt_id & 0x0F
+
+                        # Map type code to type name
+                        TYPE_MAP = {
+                            1: "EEG4",
+                            2: "EEG8",
+                            3: "REF",
+                            4: "Optics4",
+                            5: "Optics8",
+                            6: "Optics16",
+                            7: "ACCGYRO",
+                            8: "Battery",
+                        }
+                        pkt_type = TYPE_MAP.get(type_code)
+
+                        # Skip unknown or REF packets
+                        if pkt_type is None or pkt_type not in BYTES_CONSUMED:
+                            offset += declared_len
+                            continue
+
+                        file_total_packets += 1
+                        total_packets += 1
+
+                        # Extract data section (everything after 14-byte header)
+                        pkt_data = pkt[14:] if len(pkt) > 14 else b""
+
+                        # Get expected bytes consumed for this packet type
+                        bytes_consumed = BYTES_CONSUMED[pkt_type]
+
+                        # Check if there's a leftover (more data after consumed bytes)
+                        if len(pkt_data) <= bytes_consumed:
+                            # No leftover (packet consumed all its data or less)
+                            offset += declared_len
+                            continue
+
+                        file_with_leftovers += 1
+                        packets_with_leftovers += 1
+
+                        # Check if byte at position bytes_consumed is a valid TAG
+                        leftover_tag = pkt_data[bytes_consumed]
+                        if leftover_tag in TAGS:
+                            file_valid += 1
+                            valid_leftovers += 1
+                        else:
+                            # Record invalid leftover for debugging
+                            if len(invalid_examples) < 5:  # Keep first 5 examples
+                                leftover_preview = pkt_data[
+                                    bytes_consumed : bytes_consumed + 10
+                                ]
+                                invalid_examples.append(
+                                    {
+                                        "line": line_num,
+                                        "pkt_type": pkt_type,
+                                        "pkt_len": declared_len,
+                                        "pkt_data_len": len(pkt_data),
+                                        "bytes_consumed": bytes_consumed,
+                                        "leftover_tag": hex(leftover_tag),
+                                        "leftover_preview": leftover_preview.hex(),
+                                    }
+                                )
+
+                        offset += declared_len
+
+                # Calculate percentage for this file
+                if file_with_leftovers > 0:
+                    file_percentage = 100.0 * file_valid / file_with_leftovers
+
+                    # Assert 100% validity
+                    self.assertEqual(
+                        file_valid,
+                        file_with_leftovers,
+                        f"{preset}: Only {file_valid}/{file_with_leftovers} ({file_percentage:.1f}%) "
+                        f"leftovers have valid TAG (out of {file_total_packets} total packets).\n"
+                        f"Invalid examples: {invalid_examples[:3]}",
+                    )
+
+                    if file_valid != file_with_leftovers:
+                        invalid_leftovers_by_file[preset] = {
+                            "valid": file_valid,
+                            "total": file_with_leftovers,
+                            "percentage": file_percentage,
+                            "examples": invalid_examples,
+                        }
+
+        # Overall statistics
+        if packets_with_leftovers > 0:
+            overall_percentage = 100.0 * valid_leftovers / packets_with_leftovers
+
+            # Assert 100% overall validity
+            self.assertEqual(
+                valid_leftovers,
+                packets_with_leftovers,
+                f"Overall: Only {valid_leftovers}/{packets_with_leftovers} ({overall_percentage:.2f}%) "
+                f"leftovers are valid (out of {total_packets} total packets).\n"
+                f"Files with issues: {list(invalid_leftovers_by_file.keys())}",
+            )
+
+            # Print success summary
+            print(
+                f"\n  ✓ Leftover TAG Validation: {valid_leftovers}/{packets_with_leftovers} "
+                f"(100%) across {len(self.test_files)} files "
+                f"({total_packets} total packets checked)"
+            )
+        else:
+            # No leftovers found (unlikely but handle gracefully)
+            self.skipTest("No packets with leftovers found in any test file")
 
 
 class TestLookupTables(unittest.TestCase):
