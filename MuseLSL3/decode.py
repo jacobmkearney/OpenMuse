@@ -16,15 +16,15 @@ Packet Structure:
 ------------------
 Each packet contains multiple subpackets encoding metadata and sensor data.
 
-Byte Offset | Field Name        | Type      | Description
-------------|-------------------|-----------|------------------------------------------
+Byte Offset | Field Name     | Type      | Description
+------------|----------------|-----------|------------------------------------------
 0           | pkt_len        | uint8     | Declared packet length (includes header)
 1           | pkt_n          | uint8     | Packet counter (0-255, wraps around)
 2-5         | pkt_time       | uint32 LE | Timestamp in milliseconds (device time)
 6-8         | pkt_unknown1   | 3 bytes   | Reserved/unknown (consistent per preset)
 9           | pkt_id         | uint8     | Frequency (high nibble) + Type (low nibble)
 10-12       | pkt_unknown2   | 3 bytes   | Metadata bytes (function unknown)
-13          | always_zero       | uint8     | Separator/padding (confirmed 100% = 0x00)
+13          | always_zero    | uint8     | Separator (confirmed 100% = 0x00)
 14+         | pkt_data       | variable  | Sample data (length = pkt_len - 14)
 
 
@@ -43,8 +43,7 @@ Notes & Known Issues:
 
 3. The BLE message structure is more sophisticated:
 - The main packet (with 14-byte header) contains a PRIMARY subpacket
-- After the primary subpacket data, SECONDARY subpackets may be bundled, identified by
-- This allows multiple sensor types to be transmitted in a single BLE message.
+- After the primary subpacket data, SECONDARY subpackets may be bundled, identified by a TAG byte
 
 Usage Example:
 --------------
@@ -100,7 +99,7 @@ ACC_SCALE = 0.0000610352
 GYRO_SCALE = -0.0074768
 
 
-def parse_message(message: str) -> List[Dict]:
+def parse_message(message: str, parse_leftovers=True) -> List[Dict]:
     """
     Parse a BLE message into a list of packets.
 
@@ -183,8 +182,36 @@ def parse_message(message: str) -> List[Dict]:
             data_accgyro.append(d)
 
         # Parse leftovers for additional sensor data
-        # Leftovers can contain additional sensor packets with structure: TAG byte followed immediately by data
-        # TODO.
+        # Empirical structure: [TAG byte][4 bytes header][data bytes...]
+        # The 4-byte header appears consistently across packet types (contains metadata/timing)
+        if parse_leftovers and leftover is not None and len(leftover) > 0:
+            # Iteratively parse ACCGYRO from leftover
+            # Continue as long as we find ACCGYRO TAGs with sufficient data
+            while leftover is not None and len(leftover) > 0:
+                # Check if first byte is a valid TAG
+                tag_byte = leftover[0]
+
+                if tag_byte not in TAGS:
+                    break  # Invalid TAG, stop parsing
+
+                tag_type = TAGS[tag_byte]
+
+                # Only continue if it's an ACCGYRO TAG
+                if tag_type != "ACCGYRO":
+                    break  # Non-ACCGYRO TAG, stop parsing
+
+                # Parse ACCGYRO from leftover
+                # Structure: [0x47 TAG][4 bytes header][36 bytes ACCGYRO data]
+                if len(leftover) >= 1 + 4 + 36:  # TAG + header + data
+                    # Skip TAG (1 byte) + header (4 bytes) = 5 bytes total
+                    d, new_leftover = decode_accgyro(leftover[5:], pkt_time)
+                    if d.size > 0:
+                        data_accgyro.append(d)
+                        leftover = new_leftover
+                    else:
+                        break  # Failed to decode, stop parsing
+                else:
+                    break  # Not enough data remaining
 
         # Build subpacket dictionary with only requested fields
         subpkt_dict = {
