@@ -65,25 +65,55 @@ def _apply_bit_offset(block: bytes, bit_offset: int) -> bytes:
 
 
 def _gather_eeg_bytes(payload: bytes) -> bytes:
+    """Collect EEG bytes only.
+
+    Primary EEG is assumed to be the untagged bytes from the start of the
+    payload up to the first recognized secondary tag. Beyond that point,
+    only explicitly tagged EEG chunks ([EEG_TAG, LEN, DATA]) are included.
+    """
     eeg = bytearray()
     i = 0
     n = len(payload)
+    first_secondary_seen = False
     while i < n:
-        # [TAG, LEN, DATA]
-        if i + 2 <= n and payload[i] in NON_EEG_TAGS and i + 2 + payload[i + 1] <= n:
-            i += 2 + payload[i + 1]
-            continue
-        if i + 2 <= n and payload[i] in EEG_IDS and i + 2 + payload[i + 1] <= n:
+        # Tagged chunk?
+        if i + 2 <= n:
+            tag = payload[i]
             ln = payload[i + 1]
-            eeg.extend(payload[i + 2 : i + 2 + ln])
-            i += 2 + ln
-            continue
-        eeg.append(payload[i])
+            if tag in NON_EEG_TAGS and i + 2 + ln <= n:
+                first_secondary_seen = True
+                i += 2 + ln
+                continue
+            if tag in EEG_IDS and i + 2 + ln <= n:
+                eeg.extend(payload[i + 2 : i + 2 + ln])
+                i += 2 + ln
+                continue
+        # Untagged byte: include only before first secondary tag
+        if not first_secondary_seen:
+            eeg.append(payload[i])
         i += 1
     return bytes(eeg)
 
 
-def decode_file(path: str, preset: str) -> Tuple[List[List[int]], int]:
+def _score_offset(blocks: List[bytes], channels: int, bit_offset: int) -> float:
+    """Lower is better: mean absolute successive diff across unpacked values."""
+    diffs_sum = 0.0
+    diffs_cnt = 0
+    for blk in blocks:
+        b = _apply_bit_offset(blk, bit_offset)
+        vals = _unpack_14bit(b, 2 * channels)
+        if len(vals) < 2:
+            continue
+        for i in range(len(vals) - 1):
+            diffs_sum += abs(vals[i + 1] - vals[i])
+            diffs_cnt += 1
+    return diffs_sum / diffs_cnt if diffs_cnt else float("inf")
+
+
+def decode_file(
+    path: str,
+    preset: str,
+) -> Tuple[List[List[float]], int]:
     """Decode a full .bin file into samples×channels with stitched EEG bytes.
 
     Returns (samples, channels) where samples is a list of per-channel lists.
@@ -98,7 +128,7 @@ def decode_file(path: str, preset: str) -> Tuple[List[List[int]], int]:
         blob = f.read()
 
     rolling = bytearray()
-    per_ch: List[List[int]] = [[] for _ in range(channels)]
+    per_ch: List[List[float]] = [[] for _ in range(channels)]
 
     for _, pkt in _parse_packets_from_bin(blob):
         if len(pkt) < 14:
@@ -112,19 +142,32 @@ def decode_file(path: str, preset: str) -> Tuple[List[List[int]], int]:
         if not eeg_bytes:
             continue
         rolling.extend(eeg_bytes)
+        # If we have at least a few blocks, sweep offsets 0..7 and lock best
+        if len(rolling) >= 28 * 4:
+            blocks = [bytes(rolling[i:i+28]) for i in range(0, 28*4, 28)]
+            best_off = bit_offset
+            best_score = _score_offset(blocks, channels, bit_offset)
+            for off in range(8):
+                if off == bit_offset:
+                    continue
+                sc = _score_offset(blocks, channels, off)
+                if sc < best_score:
+                    best_score = sc
+                    best_off = off
+            bit_offset = best_off
+
         # process full 28B blocks
         while len(rolling) >= 28:
             block = bytes(rolling[:28])
             rolling = rolling[28:]
-            block = _apply_bit_offset(block, bit_offset)
-            vals = _unpack_14bit(block, 2 * channels)
+            vals = _unpack_14bit(_apply_bit_offset(block, bit_offset), 2 * channels)
             if len(vals) < 2 * channels:
                 continue
             s1 = vals[:channels]
             s2 = vals[channels: 2 * channels]
             for ch in range(channels):
-                per_ch[ch].append(s1[ch])
-                per_ch[ch].append(s2[ch])
+                per_ch[ch].append(float(s1[ch]))
+                per_ch[ch].append(float(s2[ch]))
 
     return per_ch, channels
 
