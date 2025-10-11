@@ -59,3 +59,6 @@ accgyro["time"].diff().hist(bins=50)
 accgyro.iloc[100:150].plot(
     x="time", y=["ACC_X", "ACC_Y", "ACC_Z", "GYRO_X", "GYRO_Y", "GYRO_Z"], subplots=True
 )
+
+# Investigate leftovers
+leftovers = [sp["leftover"] for pkt in packets for sp in pkt]

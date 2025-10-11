@@ -95,12 +95,12 @@ TYPE_MAP = {
 TAGS = {
     0x11: "EEG4",
     0x12: "EEG8",
-    0x13: "REF",
+    # 0x13: "REF",  # Not observed in any test data files
     0x34: "Optics4",
     0x35: "Optics8",
     0x36: "Optics16",
     0x47: "ACCGYRO",
-    0x53: "Unknown",  # Undocumented sensor type
+    0x53: "Unknown",  # 24-byte structure at 32 Hz (freq_code=5, type_code=3)
     0x98: "Battery",
 }
 
@@ -208,13 +208,25 @@ def parse_message(message: str, parse_leftovers=True) -> List[Dict]:
         # Empirical structure: [TAG byte][4 bytes header][data bytes...]
         # The 4-byte header appears consistently across packet types (contains metadata/timing)
         if parse_leftovers and leftover is not None and len(leftover) > 0:
-            # Collect leftover data arrays (will be inserted before primary data)
+            # Collect leftover data arrays by type (will be inserted before primary data)
             leftover_data_accgyro = []
+            leftover_data_eeg = []
+            leftover_data_optics = []
+            leftover_data_battery = []
 
-            # Iteratively parse ACCGYRO from leftover
-            # Continue as long as we find ACCGYRO TAGs with sufficient data
-            leftover_count = 0  # Track number of leftover packets parsed
+            # Track counts per sensor type for time backfilling
+            leftover_counts = {
+                "ACCGYRO": 0,
+                "EEG4": 0,
+                "EEG8": 0,
+                "Optics4": 0,
+                "Optics8": 0,
+                "Optics16": 0,
+                "Battery": 0,
+            }
 
+            # Iteratively parse all sensor types from leftover
+            # Continue as long as we find valid TAGs with sufficient data
             while leftover is not None and len(leftover) > 0:
                 # Check if first byte is a valid TAG
                 tag_byte = leftover[0]
@@ -224,41 +236,118 @@ def parse_message(message: str, parse_leftovers=True) -> List[Dict]:
 
                 tag_type = TAGS[tag_byte]
 
-                # Only continue if it's an ACCGYRO TAG
-                if tag_type != "ACCGYRO":
-                    break  # Non-ACCGYRO TAG, stop parsing
+                # Determine required bytes for this packet type
+                # Structure: [TAG (1 byte)][header (4 bytes)][data (variable bytes)]
+                bytes_for_type = {
+                    "ACCGYRO": 1 + 4 + 36,  # 3 samples × 6 channels × 2 bytes
+                    "Battery": 1 + 4 + 20,  # 2 bytes SOC + 18 bytes metadata
+                    "EEG4": 1 + 4 + 28,  # 4 samples × 4 channels × 14 bits
+                    "EEG8": 1 + 4 + 28,  # 2 samples × 8 channels × 14 bits
+                    "Optics4": 1 + 4 + 30,  # 3 samples × 4 channels × 20 bits
+                    "Optics8": 1 + 4 + 40,  # 2 samples × 8 channels × 20 bits
+                    "Optics16": 1 + 4 + 40,  # 1 sample × 16 channels × 20 bits
+                    "Unknown": 1 + 4 + 24,  # 24-byte structure (validated 100%)
+                }
 
-                # Parse ACCGYRO from leftover
-                # Structure: [0x47 TAG][4 bytes header][36 bytes ACCGYRO data]
-                if len(leftover) >= 1 + 4 + 36:  # TAG + header + data
-                    leftover_count += 1
+                bytes_needed = bytes_for_type.get(tag_type)
+                if bytes_needed is None or len(leftover) < bytes_needed:
+                    break  # Not enough data remaining
 
-                    # Calculate adjusted timestamp for this leftover packet
-                    # Each ACCGYRO packet contains 3 samples at 52 Hz (3/52 seconds of data)
-                    # Leftover packets represent data from earlier time periods
-                    # Work backward from pkt_time by the appropriate interval
+                # Skip Unknown packets (no decoder implemented yet)
+                # But consume the bytes to continue parsing other sensors
+                if tag_type == "Unknown":
+                    leftover = leftover[bytes_needed:]
+                    continue  # Skip to next leftover packet
+
+                # Parse based on sensor type
+                leftover_counts[tag_type] += 1
+
+                # Skip TAG (1 byte) + header (4 bytes) = 5 bytes total
+                # Note: The 4-byte header likely contains timing information,
+                # but for now we use theoretical backfilling based on sampling rates
+                leftover_pkt_data = leftover[5:]
+
+                if tag_type == "ACCGYRO":
+                    # Each ACCGYRO packet contains 3 samples at 52 Hz
                     samples_per_packet = 3
                     leftover_pkt_time = pkt_time - (
-                        leftover_count * samples_per_packet / 52.0
+                        leftover_counts["ACCGYRO"] * samples_per_packet / 52.0
                     )
-
-                    # Skip TAG (1 byte) + header (4 bytes) = 5 bytes total
-                    # Note: The 4-byte header likely contains timing information,
-                    # but for now we use theoretical backfilling at 52 Hz
-                    d, new_leftover = decode_accgyro(leftover[5:], leftover_pkt_time)
+                    d, new_leftover = decode_accgyro(
+                        leftover_pkt_data, leftover_pkt_time
+                    )
                     if d.size > 0:
                         leftover_data_accgyro.append(d)
                         leftover = new_leftover
                     else:
-                        break  # Failed to decode, stop parsing
+                        break
+
+                elif tag_type == "Battery":
+                    # Battery packets at ~0.1 Hz (every 10 seconds)
+                    leftover_pkt_time = pkt_time - (leftover_counts["Battery"] * 10.0)
+                    d, new_leftover = decode_battery(
+                        leftover_pkt_data, leftover_pkt_time
+                    )
+                    if d.size > 0:
+                        leftover_data_battery.append(d)
+                        leftover = new_leftover
+                    else:
+                        break
+
+                elif tag_type in ["EEG4", "EEG8"]:
+                    # EEG at 256 Hz
+                    n_channels = 4 if tag_type == "EEG4" else 8
+                    n_samples = 4 if tag_type == "EEG4" else 2
+                    leftover_pkt_time = pkt_time - (
+                        leftover_counts[tag_type] * n_samples / 256.0
+                    )
+                    d, new_leftover = decode_eeg(
+                        leftover_pkt_data, leftover_pkt_time, n_channels
+                    )
+                    if d.size > 0:
+                        leftover_data_eeg.append(d)
+                        leftover = new_leftover
+                    else:
+                        break
+
+                elif tag_type in ["Optics4", "Optics8", "Optics16"]:
+                    # Optics at ~64 Hz (nominal)
+                    n_channels = (
+                        4
+                        if tag_type == "Optics4"
+                        else 8 if tag_type == "Optics8" else 16
+                    )
+                    n_samples = (
+                        3
+                        if tag_type == "Optics4"
+                        else 2 if tag_type == "Optics8" else 1
+                    )
+                    leftover_pkt_time = pkt_time - (
+                        leftover_counts[tag_type] * n_samples / 64.0
+                    )
+                    d, new_leftover = decode_optics(
+                        leftover_pkt_data, leftover_pkt_time, n_channels
+                    )
+                    if d.size > 0:
+                        leftover_data_optics.append(d)
+                        leftover = new_leftover
+                    else:
+                        break
                 else:
-                    break  # Not enough data remaining
+                    break  # Unknown type, stop parsing
 
             # Insert leftover data BEFORE primary data (oldest to newest)
             # Leftover packets are older than the primary packet
-            # Reverse the list since we parsed them newest-to-oldest
+            # Reverse the lists since we parsed them newest-to-oldest
             leftover_data_accgyro.reverse()
+            leftover_data_eeg.reverse()
+            leftover_data_optics.reverse()
+            leftover_data_battery.reverse()
+
             data_accgyro = leftover_data_accgyro + data_accgyro
+            data_eeg = leftover_data_eeg + data_eeg
+            data_optics = leftover_data_optics + data_optics
+            data_battery = leftover_data_battery + data_battery
 
         # Build subpacket dictionary with only requested fields
         subpkt_dict = {

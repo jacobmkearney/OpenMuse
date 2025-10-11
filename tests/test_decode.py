@@ -525,7 +525,7 @@ class TestParseMessage(unittest.TestCase):
             "Optics16": 40,
             "ACCGYRO": 36,
             "Battery": 20,  # 2 bytes SOC + 18 bytes metadata
-            # REF packets don't have decoders yet, skip them
+            "REF": 24,  # 12 reference values × 2 bytes (validated 100%)
         }
 
         # Statistics tracking
