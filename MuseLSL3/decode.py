@@ -94,12 +94,13 @@ TAGS = {
     0x35: "Optics8",
     0x36: "Optics16",
     0x47: "ACCGYRO",
-    0x53: "UNKNOWN",  # Undocumented sensor type
+    0x53: "Unknown",  # Undocumented sensor type
     0x98: "Battery",
 }
 
 ACC_SCALE = 0.0000610352
 GYRO_SCALE = -0.0074768
+OPTICS_SCALE = 1.0 / 32768.0
 
 
 def parse_message(message: str, parse_leftovers=True) -> List[Dict]:
@@ -176,6 +177,7 @@ def parse_message(message: str, parse_leftovers=True) -> List[Dict]:
 
         data_accgyro = []
         data_battery = []
+        data_optics = []
 
         # Parse primary data
         if pkt_valid and pkt_type == "Battery":
@@ -184,6 +186,12 @@ def parse_message(message: str, parse_leftovers=True) -> List[Dict]:
         if pkt_valid and pkt_type == "ACCGYRO":
             d, leftover = decode_accgyro(pkt_data, pkt_time)
             data_accgyro.append(d)
+        if pkt_valid and pkt_type in ["Optics4", "Optics8", "Optics16"]:
+            n_channels = (
+                4 if pkt_type == "Optics4" else 8 if pkt_type == "Optics8" else 16
+            )
+            d, leftover = decode_optics(pkt_data, pkt_time, n_channels)
+            data_optics.append(d)
 
         # Parse leftovers for additional sensor data
         # Empirical structure: [TAG byte][4 bytes header][data bytes...]
@@ -257,6 +265,7 @@ def parse_message(message: str, parse_leftovers=True) -> List[Dict]:
             "leftover": leftover,
             "data_accgyro": data_accgyro,
             "data_battery": data_battery,
+            "data_optics": data_optics,
         }
 
         subpackets.append(subpkt_dict)
@@ -371,6 +380,99 @@ def decode_accgyro(pkt_data: bytes, pkt_time: float):
     data = np.hstack((times.reshape(-1, 1), data))
 
     leftover = pkt_data[bytes_needed:]  # leftover bytes undecoded
+
+    return data, leftover
+
+
+def decode_optics(pkt_data: bytes, pkt_time: float, n_channels: int):
+    """
+    Decode optical sensor data from OPTICS packet.
+
+    OPTICS packets contain 3 samples of n-channel optical data, where each value
+    is encoded as a 20-bit unsigned integer.
+
+    Data Format:
+    ------------
+    - Each sample contains n_channels × 20-bit values
+    - Total bits per packet: 3 samples × n_channels × 20 bits
+    - Bits are packed in little-endian byte order
+    - Each 20-bit value spans across bytes with LSB first
+
+    Supported Configurations:
+    -------------------------
+    - Optics4:  4 channels, 64 Hz sampling rate, 30 bytes (480 bits)
+    - Optics8:  8 channels, 64 Hz sampling rate, 60 bytes (960 bits)
+    - Optics16: 16 channels, 64 Hz sampling rate, 120 bytes (1920 bits)
+
+    Scaling:
+    --------
+    - Raw 20-bit integers are divided by 32768 to normalize
+
+    Timing:
+    -------
+    - Samples are back-filled from pkt_time at the specified sampling rate
+    - For 64 Hz: Sample times are [pkt_time - 2/64, pkt_time - 1/64, pkt_time]
+
+    Parameters:
+    -----------
+    pkt_data : bytes
+        Raw packet data containing optical sensor values
+    pkt_time : float
+        Packet timestamp (seconds)
+    n_channels : int
+        Number of optical channels (4, 8, or 16)
+
+    Returns:
+    --------
+    data : np.ndarray, shape (3, n_channels + 1)
+        Array with columns: [time, OPTICS_01, OPTICS_02, ..., OPTICS_N]
+    leftover : bytes
+        Remaining unparsed bytes after primary OPTICS data
+    """
+    # Calculate required bytes: 3 samples × n_channels × 20 bits / 8 bits per byte
+    bits_needed = 3 * n_channels * 20
+    bytes_needed = bits_needed // 8
+
+    if bytes_needed > len(pkt_data):
+        return np.empty((0, n_channels + 1), dtype=np.float32), pkt_data
+
+    block = pkt_data[0:bytes_needed]
+
+    # Convert bytes to bit array (LSB first within each byte)
+    bits = []
+    for byte in block:
+        for bit_pos in range(8):
+            bits.append((byte >> bit_pos) & 1)
+
+    # Parse 3 samples, each with n_channels × 20-bit values
+    data = np.zeros((3, n_channels), dtype=np.float32)
+
+    for sample_idx in range(3):
+        for channel_idx in range(n_channels):
+            # Calculate bit position for this value
+            bit_start = (sample_idx * n_channels + channel_idx) * 20
+            bit_end = bit_start + 20
+
+            # Extract 20 bits and convert to integer (little-endian bit order)
+            int_value = 0
+            for bit_idx in range(20):
+                if bits[bit_start + bit_idx]:
+                    int_value |= 1 << bit_idx
+
+            # Scale and store
+            data[sample_idx, channel_idx] = int_value * OPTICS_SCALE
+
+    # Add back-filled time vector according to sampling rate (64 Hz)
+    num_samples = 3
+    times = (
+        pkt_time - (num_samples - 1) * (1 / 64.0) + np.arange(num_samples) * (1 / 64.0)
+    )
+
+    # Add times as the first column (keep as float64 for precision with large timestamps)
+    times_col = times.reshape(-1, 1).astype(np.float64)
+    data = np.hstack((times_col, data))
+
+    leftover = pkt_data[bytes_needed:]
 
     return data, leftover
 
