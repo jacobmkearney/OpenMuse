@@ -17,6 +17,58 @@ pip install -e .
 
 ## Usage
 
+### EEG decoding quickstart (prototype)
+
+Decode stitched EEG from a `.bin` into a NumPy NPZ (samples×channels), using frozen preset defaults (bit offset, channels):
+
+```bash
+PYTHONPATH=/Users/jacobkearney/Documents/personal/MuseLSL3 \
+python3 /Users/jacobkearney/Documents/personal/MuseLSL3/tools/muse_eeg_decode.py \
+  --preset p1045 \
+  --infile /Users/jacobkearney/Documents/personal/MuseLSL3/data/p1045/session.bin \
+  --out /Users/jacobkearney/Documents/personal/MuseLSL3/p1045_eeg.npz
+```
+
+Plot a ~3 s window with alpha bars and blink markers (uses locked bit offsets per preset):
+
+```bash
+PYTHONPATH=/Users/jacobkearney/Documents/personal/MuseLSL3 \
+python3 /Users/jacobkearney/Documents/personal/MuseLSL3/tools/plot_eeg_quick.py \
+  --preset p1045 \
+  --infile /Users/jacobkearney/Documents/personal/MuseLSL3/data/p1045/session.bin \
+  --seconds 3 --rate 256 --detect-blinks \
+  --out /Users/jacobkearney/Documents/personal/MuseLSL3/p1045_quick.png
+```
+
+Verify ~256 Hz empirically (wall-clock from text recording):
+
+```bash
+MuseLSL3 record --preset p1045 --duration 30 --outfile /Users/jacobkearney/Documents/personal/MuseLSL3/data/p1045/rate_check_30s.txt
+
+PYTHONPATH=/Users/jacobkearney/Documents/personal/MuseLSL3 \
+python3 /Users/jacobkearney/Documents/personal/MuseLSL3/tools/estimate_eeg_rate_wallclock.py \
+  --infile /Users/jacobkearney/Documents/personal/MuseLSL3/data/p1045/rate_check_30s.txt
+```
+
+Segment packets and inspect base units (28/56 B):
+
+```bash
+PYTHONPATH=/Users/jacobkearney/Documents/personal/MuseLSL3 \
+python3 /Users/jacobkearney/Documents/personal/MuseLSL3/tools/segment_packets.py \
+  --preset p1045 \
+  --infile /Users/jacobkearney/Documents/personal/MuseLSL3/data/p1045/session.bin \
+  --csvout /Users/jacobkearney/Documents/personal/MuseLSL3/data/p1045/segmented.csv
+
+PYTHONPATH=/Users/jacobkearney/Documents/personal/MuseLSL3 \
+python3 /Users/jacobkearney/Documents/personal/MuseLSL3/tools/inspect_eeg_units.py \
+  --preset p1045 \
+  --csv /Users/jacobkearney/Documents/personal/MuseLSL3/data/p1045/segmented.csv
+```
+
+Notes:
+- Preset defaults (bit offsets, channel count) are heuristic but stable in our tests: `p1035=2/4ch`, `p1041=0/8ch`, `p1045=3/8ch`.
+- The stitched decoder scans full payloads, skips non-EEG chunks, and joins EEG units across packet boundaries.
+
 ### Find Muse devices
 
 ```powershell

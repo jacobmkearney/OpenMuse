@@ -215,3 +215,72 @@ p1045 | 0x12 | 226 | — | 16
 - Co-packed tags detected (0x34/0x36 optics, 0x47 IMU, 0x98 battery) corroborate that leftover bytes hold additional sensor data alongside EEG.
 
 These observations support a primary+leftovers packet model and provide preliminary samples-per-packet counts to guide EEG/optics decoder design.
+
+
+### Channel mapping (heuristic) — p1045
+Aggregated 3 files at 2025-10-11T12:27:04.436240Z
+
+Top pairs (i,j)->count:
+
+- (1,2) -> 13
+- (5,7) -> 11
+- (0,3) -> 9
+- (4,6) -> 7
+- (5,6) -> 7
+- (4,7) -> 6
+- (3,5) -> 6
+- (1,4) -> 6
+
+Per-channel medians:
+
+ch | blink_median | alpha_median
+:-:|:-:|:-:
+0 | 7995.0 | 0.155
+1 | 8068.5 | 0.127
+2 | 8184.0 | 0.145
+3 | 8100.0 | 0.120
+4 | 8012.5 | 0.107
+5 | 8064.0 | 0.146
+6 | 8114.5 | 0.181
+7 | 7957.0 | 0.114
+
+Suggested frontal: 2, 6
+Suggested posterior: 6, 0
+
+
+### Channel mapping (heuristic) — p1035
+Aggregated 1 files at 2025-10-11T12:28:43.414547Z
+
+Top pairs (i,j)->count:
+
+- (0,3) -> 5
+- (1,2) -> 5
+- (0,1) -> 4
+- (2,3) -> 4
+- (0,2) -> 1
+- (1,3) -> 1
+
+Per-channel medians:
+
+ch | blink_median | alpha_median
+:-:|:-:|:-:
+0 | 8037.0 | 0.090
+1 | 8102.8 | 0.090
+2 | 8096.0 | 0.139
+3 | 8134.8 | 0.094
+
+Suggested frontal: 3, 1
+Suggested posterior: 2, 3
+
+
+### Alpha delta (closed - open) — p1045
+ch | alpha_open | alpha_closed | delta
+:-:|:-:|:-:|:-:
+0 | 0.093 | 0.082 | -0.010
+1 | 0.101 | 0.103 | 0.003
+2 | 0.105 | 0.104 | -0.001
+3 | 0.109 | 0.114 | 0.005
+4 | 0.087 | 0.117 | 0.030
+5 | 0.103 | 0.125 | 0.022
+6 | 0.112 | 0.123 | 0.010
+7 | 0.127 | 0.127 | 0.001

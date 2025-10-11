@@ -34,7 +34,7 @@ def main(argv=None):
         "record", help="Connect and record raw packets to a file (text or .bin)"
     )
     p_rec.add_argument(
-        "--address", required=False, help="Device address; omit to auto-discover"
+        "--address", required=False, help="Optional device address. omit to auto-discover"
     )
     p_rec.add_argument(
         "--duration",
