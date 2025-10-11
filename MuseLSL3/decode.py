@@ -5,54 +5,78 @@ Muse BLE Message Parser
 Efficiently parses BLE (Bluetooth Low Energy) messages from Muse devices into
 structured packets for downstream signal processing.
 
-Functions:
-----------
-- parse_message(message: str) -> List[Dict]: Parse BLE message into packets
-- decode_battery(pkt_data: bytes, pkt_time: float) -> tuple[np.ndarray, bytes]:
-    Extract battery percentage from packet data
-- decode_eeg(pkt_data: bytes, pkt_time: float, n_channels: int) -> tuple[np.ndarray, bytes]:
-    Decode EEG4/EEG8 data with 14-bit precision
-- decode_accgyro(pkt_data: bytes, pkt_time: float) -> tuple[np.ndarray, bytes]:
-    Decode accelerometer and gyroscope data
-- decode_optics(pkt_data: bytes, pkt_time: float, n_channels: int) -> tuple[np.ndarray, bytes]:
-    Decode Optics4/Optics8/Optics16 data with 20-bit precision
-
-
-Packet Structure:
+Message Structure:
 ------------------
-Each packet contains multiple subpackets encoding metadata and sensor data.
+Each BLE MESSAGE (timestamped transmission) contains one or more PACKETS.
+Each PACKET contains one or more DATA SUBPACKETS with sensor data.
 
+MESSAGE (BLE transmission with message timestamp)
+  └─ PACKET (14-byte header + variable data)
+       ├─ Packet Header (14 bytes)
+       └─ DATA SUBPACKETS (variable, multiple per packet)
+            ├─ TAG (1 byte): Frequency (high nibble) + Type (low nibble)
+            ├─ Subpacket counter (1 byte): Per-sensor-type counter (0-255, wraps)
+            ├─ Unknown metadata (3 bytes): Function unknown
+            └─ Sensor data (variable): Format depends on sensor type
+
+
+Packet Header Structure (14 bytes):
+------------------------------------
 Byte Offset | Field Name     | Type      | Description
 ------------|----------------|-----------|------------------------------------------
 0           | pkt_len        | uint8     | Declared packet length (includes header)
-1           | pkt_n          | uint8     | Packet counter (0-255, wraps around)
-2-5         | pkt_time       | uint32 LE | Timestamp in 256 kHz ticks (device uptime)
+1           | pkt_n          | uint8     | Global packet counter (0-255, wraps)
+2-5         | pkt_time       | uint32 LE | Machine timestamp (256 kHz ticks, device uptime)
 6-8         | pkt_unknown1   | 3 bytes   | Reserved/unknown (consistent per preset)
-9           | pkt_id         | uint8     | Frequency (high nibble) + Type (low nibble)
+9           | pkt_id         | uint8     | Primary sensor: Freq (high nibble) + Type (low)
 10-12       | pkt_unknown2   | 3 bytes   | Metadata bytes (function unknown)
 13          | always_zero    | uint8     | Separator (confirmed 100% = 0x00)
-14+         | pkt_data       | variable  | Sample data (length = pkt_len - 14)
 
-IMPORTANT: Device timestamps (bytes 2-5) are in 256 kHz clock ticks (2^18 Hz),
+IMPORTANT: Packet timestamps (pkt_time, bytes 2-5) are in 256 kHz clock ticks,
 NOT milliseconds. Divide by 256000 to convert to seconds.
+
+
+Data Subpacket Structure (variable length):
+--------------------------------------------
+Byte Offset | Field Name     | Type      | Description
+------------|----------------|-----------|------------------------------------------
+0           | TAG            | uint8     | Frequency (high nibble) + Type (low nibble)
+1           | subpkt_counter | uint8     | Per-sensor-type counter (0-255, wraps)
+2-4         | subpkt_unknown | 3 bytes   | Metadata bytes (function unknown)
+5+          | sensor_data    | variable  | Encoded sensor samples (length varies by type)
+
+Multiple DATA SUBPACKETS can appear in sequence within a single packet. Each
+subpacket has its own TAG identifying the sensor type. The subpkt_counter is
+INDEPENDENT for each sensor type (EEG has its own counter, ACCGYRO has its own, etc.).
+
+
+Counter Systems:
+----------------
+1. pkt_n (byte 1 of packet header): GLOBAL counter across all sensors
+   - Increments for each packet regardless of sensor type
+   - Shared across EEG, ACCGYRO, Optics, Battery, etc.
+   - Wraps at 255 back to 0
+
+2. subpkt_counter (byte 1 after TAG): PER-SENSOR-TYPE counter
+   - Independent counter for each sensor type
+   - EEG has its own sequence: 0, 1, 2, 3...
+   - ACCGYRO has its own sequence: 0, 1, 2, 3...
+   - Tracks data continuity within each sensor stream
+   - Wraps at 255 back to 0
+   - Validated alignment with expected timing (ratio ~1.003-1.005)
 
 
 Notes & Known Issues:
 ---------------------
-1. TIMESTAMPS NOT STRICTLY MONOTONIC: Device timestamps (pkt_time) are mostly
-   increasing but can occasionally arrive out-of-order (to be confirmed).
+1. TIMESTAMPS NOT STRICTLY MONOTONIC: Packet timestamps (pkt_time) are mostly
+   increasing but can occasionally arrive out-of-order (6.5% ACCGYRO, 2.1% EEG).
+   Current backfilling assumes chronological order but data chunks are interleaved.
 
-2. UNKNOWN FIELDS: Bytes 6-8 (pkt_unknown1) and 10-12 (pkt_unknown2) have
-   consistent patterns per preset but their exact meaning is not yet decoded. They
-   may contain:
-   - Fine-grained timing information
-   - Sample indexing within packet
-   - Device state flags
-   - Quality indicators
+2. UNKNOWN FIELDS:
+   - Packet header bytes 6-8 (pkt_unknown1) and 10-12 (pkt_unknown2)
+   - Subpacket bytes 2-4 (subpkt_unknown)
+   These have consistent patterns but their exact meaning is not yet decoded.
 
-3. The BLE message structure is more sophisticated:
-- The main packet (with 14-byte header) contains a PRIMARY subpacket
-- After the primary subpacket data, SECONDARY subpackets may be bundled, identified by a TAG byte
 
 Usage Example:
 --------------

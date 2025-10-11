@@ -1,12 +1,52 @@
 import numpy as np
 import pandas as pd
 
-from MuseLSL3.decode import parse_message
-
+from MuseLSL3.decode import parse_message as parse_message_old
+from MuseLSL3.decode_new import parse_message, decode_rawdata
 
 with open("../tests/test_data/test_accgyro.txt", "r", encoding="utf-8") as f:
     messages = f.readlines()
-packets = [parse_message(m, parse_leftovers=True) for m in messages]
+data = decode_rawdata(messages)
+
+data["ACCGYRO"].sort_values("time").plot(
+    x="time",
+    y=["ACC_X", "ACC_Y", "ACC_Z", "GYRO_X", "GYRO_Y", "GYRO_Z"],
+    subplots=True,
+    title="ACCGYRO Data",
+)
+data["ACCGYRO"].sort_values("time").iloc[500:700, :].plot(
+    x="time",
+    y=["ACC_X", "ACC_Y", "ACC_Z", "GYRO_X", "GYRO_Y", "GYRO_Z"],
+    subplots=True,
+    title="ACCGYRO Data (First 1000 Samples)",
+)
+
+with open("../tests/test_data/test_optics4.txt", "r", encoding="utf-8") as f:
+    messages = f.readlines()
+data = decode_rawdata(messages)
+data["Optics"].plot(
+    x="time",
+    subplots=True,
+    title="OPTICS Data",
+)
+print(f"Effective OPTICS sampling rate: {len(data['Optics']) / 90:.2f} Hz")
+
+with open("../tests/test_data/test_optics16.txt", "r", encoding="utf-8") as f:
+    messages = f.readlines()
+data = decode_rawdata(messages)
+data["Optics"].plot(
+    x="time",
+    subplots=True,
+    title="OPTICS Data",
+)
+
+
+data["Battery"].sort_values("time").plot(x="time", y=["battery_percent"])
+print(f"Effective ACCGYRO sampling rate: {len(data["ACCGYRO"]) / 90:.2f} Hz")
+
+with open("../tests/test_data/test_accgyro.txt", "r", encoding="utf-8") as f:
+    messages = f.readlines()
+packets = [parse_message_old(m, parse_leftovers=True) for m in messages]
 print(f"Total packets: {len(packets)}")
 
 
