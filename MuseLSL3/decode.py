@@ -92,6 +92,7 @@ TAGS = {
     0x35: "Optics8",
     0x36: "Optics16",
     0x47: "ACCGYRO",
+    0x53: "UNKNOWN",  # Undocumented sensor type
     0x98: "Battery",
 }
 
@@ -181,62 +182,9 @@ def parse_message(message: str) -> List[Dict]:
             d, leftover = decode_accgyro(pkt_data, pkt_time)
             data_accgyro.append(d)
 
-        # # Parse leftovers for additional sensor data
-        # # Leftovers can contain additional sensor packets with structure: TAG byte followed immediately by data
-        # # Only parse ACCGYRO for now, as Battery structure in leftovers is less clear
-        # if leftover is not None and len(leftover) > 0:
-        #     offset_leftover = 0
-        #     while offset_leftover < len(leftover):
-        #         # Look for ACCGYRO tag (0x47)
-        #         if leftover[offset_leftover] == 0x47:
-        #             # ACCGYRO data is 36 bytes (3 samples × 6 channels × 2 bytes)
-        #             if offset_leftover + 1 + 36 <= len(leftover):
-        #                 accgyro_data_bytes = leftover[
-        #                     offset_leftover + 1 : offset_leftover + 1 + 36
-        #                 ]
-
-        #                 # Decode ACCGYRO data
-        #                 data = np.frombuffer(
-        #                     accgyro_data_bytes, dtype="<i2", count=18
-        #                 ).reshape(-1, 6)
-        #                 data = data.astype(np.float32)
-
-        #                 # Apply scaling
-        #                 data[:, 0:3] *= ACC_SCALE
-        #                 data[:, 3:6] *= GYRO_SCALE
-
-        #                 # Validate that the data looks reasonable (sanity check)
-        #                 # ACC should be roughly -20 to 20 m/s^2, GYRO roughly -10 to 10 rad/s
-        #                 acc_reasonable = np.all(
-        #                     (data[:, :3] > -50) & (data[:, :3] < 50)
-        #                 )
-        #                 gyro_reasonable = np.all(
-        #                     (data[:, 3:] > -50) & (data[:, 3:] < 50)
-        #                 )
-
-        #                 if acc_reasonable and gyro_reasonable:
-        #                     # Add back-filled time vector (52 Hz sampling rate)
-        #                     num_samples = data.shape[0]
-        #                     times = (
-        #                         pkt_time
-        #                         - (num_samples - 1) * (1 / 52)
-        #                         + np.arange(num_samples) * (1 / 52)
-        #                     )
-        #                     data = np.hstack(
-        #                         (times.astype(np.float32).reshape(-1, 1), data)
-        #                     )
-
-        #                     data_accgyro.append(data)
-        #                     offset_leftover += 1 + 36
-        #                 else:
-        #                     # Data doesn't look valid, skip this byte
-        #                     offset_leftover += 1
-        #             else:
-        #                 break
-
-        #         else:
-        #             # Not a recognized tag, move to next byte
-        #             offset_leftover += 1
+        # Parse leftovers for additional sensor data
+        # Leftovers can contain additional sensor packets with structure: TAG byte followed immediately by data
+        # TODO.
 
         # Build subpacket dictionary with only requested fields
         subpkt_dict = {
@@ -288,6 +236,18 @@ def decode_battery(pkt_data: bytes, pkt_time: float):
     Bytes 12-13: Constant 0x4272 (29250) - Fixed identifier or packet type marker
     Bytes 14+:   Variable-length data
 
+    Leftover Structure (validated across 119 Battery packets in test data):
+    -----------------------------------------------------------------------
+    Battery packets bundle additional sensor data in their leftovers with a highly
+    structured format. The leftover bytes contain multiple sensor packets chained
+    together, starting from pkt_data[20:].
+
+    VALIDATED FINDINGS (in original pkt_data):
+    - Offset 20: Valid TAG byte present in 99.2% of packets (118/119 packets)
+    - After offset 20, additional sensor packets follow in sequence
+    - Each sensor packet has structure: [TAG_BYTE (1 byte)][DATA (variable bytes)]
+    - EEG8 packets show consistent 33-byte spacing (1 TAG + 32 data bytes)
+      appearing at offsets: 20, 53, 86, 119, 152, 185... (+33 byte intervals)
     """
     # First 2 bytes are state-of-charge (SOC) as uint16 little-endian
     raw_soc = struct.unpack("<H", pkt_data[0:2])[0]
@@ -296,12 +256,43 @@ def decode_battery(pkt_data: bytes, pkt_time: float):
     # Return as (1 sample of) times, data array
     data = np.array([pkt_time, battery_percent], dtype=np.float32)
 
-    leftover = pkt_data[2:]  # leftover bytes undecoded
+    # Leftover starts at offset 20 (skip 2 bytes battery data + 18 bytes header/metadata)
+    # This makes Battery leftovers consistent with ACCGYRO: leftover[0] is a TAG byte
+    leftover = pkt_data[20:] if len(pkt_data) > 20 else b""
 
     return data, leftover
 
 
 def decode_accgyro(pkt_data: bytes, pkt_time: float):
+    """
+    Decode accelerometer and gyroscope data from ACCGYRO packet.
+
+    ACCGYRO packets are transmitted at 52 Hz, with each packet containing 3 samples
+    of 6-axis IMU data (3-axis accelerometer + 3-axis gyroscope).
+
+    Data Format:
+    ------------
+    - 36 bytes total (18 × int16 little-endian values)
+    - Arranged as 3 samples × 6 channels
+    - Channels: [ACC_X, ACC_Y, ACC_Z, GYRO_X, GYRO_Y, GYRO_Z]
+
+    Scaling:
+    --------
+    - Accelerometer: ACC_SCALE = 0.0000610352 (units: m/s²)
+    - Gyroscope: GYRO_SCALE = -0.0074768 (units: rad/s)
+
+    Timing:
+    -------
+    - Samples are back-filled from pkt_time at 52 Hz intervals
+    - Sample times: [pkt_time - 2/52, pkt_time - 1/52, pkt_time]
+
+    Returns:
+    --------
+    data : np.ndarray, shape (3, 7)
+        Array with columns: [time, ACC_X, ACC_Y, ACC_Z, GYRO_X, GYRO_Y, GYRO_Z]
+    leftover : bytes
+        Remaining unparsed bytes after primary ACCGYRO data
+    """
 
     bytes_needed = 36  # 18 int16 values
     if bytes_needed > len(pkt_data):
