@@ -20,12 +20,15 @@ Byte Offset | Field Name     | Type      | Description
 ------------|----------------|-----------|------------------------------------------
 0           | pkt_len        | uint8     | Declared packet length (includes header)
 1           | pkt_n          | uint8     | Packet counter (0-255, wraps around)
-2-5         | pkt_time       | uint32 LE | Timestamp in milliseconds (device time)
+2-5         | pkt_time       | uint32 LE | Timestamp in 256 kHz ticks (device uptime)
 6-8         | pkt_unknown1   | 3 bytes   | Reserved/unknown (consistent per preset)
 9           | pkt_id         | uint8     | Frequency (high nibble) + Type (low nibble)
 10-12       | pkt_unknown2   | 3 bytes   | Metadata bytes (function unknown)
 13          | always_zero    | uint8     | Separator (confirmed 100% = 0x00)
 14+         | pkt_data       | variable  | Sample data (length = pkt_len - 14)
+
+IMPORTANT: Device timestamps (bytes 2-5) are in 256 kHz clock ticks (2^18 Hz),
+NOT milliseconds. Divide by 256000 to convert to seconds.
 
 
 Notes & Known Issues:
@@ -143,8 +146,9 @@ def parse_message(message: str, parse_leftovers=True) -> List[Dict]:
         # Parse header fields
         pkt_len = pkt[0]
         pkt_n = pkt[1]
-        pkt_time_ms = struct.unpack_from("<I", pkt, 2)[0]  # uint32 little-endian
-        pkt_time = pkt_time_ms * 1e-3  # Convert to seconds
+        pkt_time_ticks = struct.unpack_from("<I", pkt, 2)[0]  # uint32 little-endian
+        # Device timestamp is in clock ticks at 256 kHz (2^18 Hz)
+        pkt_time = pkt_time_ticks / 256000.0  # Convert ticks to seconds
         pkt_unknown1 = pkt[6:9]  # Reserved bytes 6-8
         pkt_id = pkt[9]
         pkt_unknown2 = pkt[10:13]  # Metadata bytes 10-12
@@ -185,8 +189,13 @@ def parse_message(message: str, parse_leftovers=True) -> List[Dict]:
         # Empirical structure: [TAG byte][4 bytes header][data bytes...]
         # The 4-byte header appears consistently across packet types (contains metadata/timing)
         if parse_leftovers and leftover is not None and len(leftover) > 0:
+            # Collect leftover data arrays (will be inserted before primary data)
+            leftover_data_accgyro = []
+
             # Iteratively parse ACCGYRO from leftover
             # Continue as long as we find ACCGYRO TAGs with sufficient data
+            leftover_count = 0  # Track number of leftover packets parsed
+
             while leftover is not None and len(leftover) > 0:
                 # Check if first byte is a valid TAG
                 tag_byte = leftover[0]
@@ -203,15 +212,34 @@ def parse_message(message: str, parse_leftovers=True) -> List[Dict]:
                 # Parse ACCGYRO from leftover
                 # Structure: [0x47 TAG][4 bytes header][36 bytes ACCGYRO data]
                 if len(leftover) >= 1 + 4 + 36:  # TAG + header + data
+                    leftover_count += 1
+
+                    # Calculate adjusted timestamp for this leftover packet
+                    # Each ACCGYRO packet contains 3 samples at 52 Hz (3/52 seconds of data)
+                    # Leftover packets represent data from earlier time periods
+                    # Work backward from pkt_time by the appropriate interval
+                    samples_per_packet = 3
+                    leftover_pkt_time = pkt_time - (
+                        leftover_count * samples_per_packet / 52.0
+                    )
+
                     # Skip TAG (1 byte) + header (4 bytes) = 5 bytes total
-                    d, new_leftover = decode_accgyro(leftover[5:], pkt_time)
+                    # Note: The 4-byte header likely contains timing information,
+                    # but for now we use theoretical backfilling at 52 Hz
+                    d, new_leftover = decode_accgyro(leftover[5:], leftover_pkt_time)
                     if d.size > 0:
-                        data_accgyro.append(d)
+                        leftover_data_accgyro.append(d)
                         leftover = new_leftover
                     else:
                         break  # Failed to decode, stop parsing
                 else:
                     break  # Not enough data remaining
+
+            # Insert leftover data BEFORE primary data (oldest to newest)
+            # Leftover packets are older than the primary packet
+            # Reverse the list since we parsed them newest-to-oldest
+            leftover_data_accgyro.reverse()
+            data_accgyro = leftover_data_accgyro + data_accgyro
 
         # Build subpacket dictionary with only requested fields
         subpkt_dict = {
@@ -280,8 +308,8 @@ def decode_battery(pkt_data: bytes, pkt_time: float):
     raw_soc = struct.unpack("<H", pkt_data[0:2])[0]
     battery_percent = raw_soc / 256.0
 
-    # Return as (1 sample of) times, data array
-    data = np.array([pkt_time, battery_percent], dtype=np.float32)
+    # Return as (1 sample of) times, data array (float64 for timestamp precision)
+    data = np.array([pkt_time, battery_percent], dtype=np.float64)
 
     # Leftover starts at offset 20 (skip 2 bytes battery data + 18 bytes header/metadata)
     # This makes Battery leftovers consistent with ACCGYRO: leftover[0] is a TAG byte
@@ -339,9 +367,105 @@ def decode_accgyro(pkt_data: bytes, pkt_time: float):
     num_samples = data.shape[0]
     times = pkt_time - (num_samples - 1) * (1 / 52) + np.arange(num_samples) * (1 / 52)
 
-    # Add times as the first column
-    data = np.hstack((times.astype(np.float32).reshape(-1, 1), data))
+    # Add times as the first column (keep as float64 for precision with large timestamps)
+    data = np.hstack((times.reshape(-1, 1), data))
 
     leftover = pkt_data[bytes_needed:]  # leftover bytes undecoded
 
     return data, leftover
+
+
+# ============================================================================
+# Wrapper Functions
+# ============================================================================
+
+
+def decode_message(message: str, parse_leftovers: bool = True) -> dict:
+    """
+    Converts new parse_message() output to old format expected by stream.py:
+    {
+        "ACC": [{"time": float, "ACC_X": float, "ACC_Y": float, "ACC_Z": float}, ...],
+        "GYRO": [{"time": float, "GYRO_X": float, "GYRO_Y": float, "GYRO_Z": float}, ...]
+    }
+
+    Parameters:
+    -----------
+    message : str
+        Tab-separated BLE message string
+    parse_leftovers : bool
+        Whether to parse leftover data (default: True)
+
+    Returns:
+    --------
+    dict : Dictionary with "ACC" and "GYRO" keys containing lists of sample dicts
+    """
+    subpackets = parse_message(message, parse_leftovers=parse_leftovers)
+
+    result = {
+        "ACC": [],
+        "GYRO": [],
+    }
+
+    for subpkt in subpackets:
+        # Extract ACCGYRO data
+        if "data_accgyro" in subpkt and len(subpkt["data_accgyro"]) > 0:
+            for acc_array in subpkt["data_accgyro"]:
+                # acc_array shape: (3, 7) with columns [time, ACC_X, ACC_Y, ACC_Z, GYRO_X, GYRO_Y, GYRO_Z]
+                for i in range(acc_array.shape[0]):
+                    row = acc_array[i, :]
+
+                    # Split into ACC and GYRO
+                    result["ACC"].append(
+                        {
+                            "time": float(row[0]),
+                            "ACC_X": float(row[1]),
+                            "ACC_Y": float(row[2]),
+                            "ACC_Z": float(row[3]),
+                        }
+                    )
+
+                    result["GYRO"].append(
+                        {
+                            "time": float(row[0]),
+                            "GYRO_X": float(row[4]),
+                            "GYRO_Y": float(row[5]),
+                            "GYRO_Z": float(row[6]),
+                        }
+                    )
+
+    return result
+
+
+def decode_rawdata(messages: list, parse_leftovers: bool = True) -> dict:
+    """
+    Decode multiple raw BLE messages and return organized data in Pandas DataFrames.
+
+    Parameters:
+    -----------
+    messages : list
+        List of BLE message strings (one per line)
+    parse_leftovers : bool
+        Whether to parse leftover data (default: True)
+
+    Returns:
+    --------
+    dict : Dictionary with pandas DataFrames for each sensor type:
+        {
+            "ACC": DataFrame with columns [time, ACC_X, ACC_Y, ACC_Z],
+            "GYRO": DataFrame with columns [time, GYRO_X, GYRO_Y, GYRO_Z]
+        }
+    """
+    import pandas as pd
+
+    all_acc = []
+    all_gyro = []
+
+    for message in messages:
+        decoded = decode_message(message, parse_leftovers=parse_leftovers)
+        all_acc.extend(decoded.get("ACC", []))
+        all_gyro.extend(decoded.get("GYRO", []))
+
+    return {
+        "ACC": pd.DataFrame(all_acc),
+        "GYRO": pd.DataFrame(all_gyro),
+    }

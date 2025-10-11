@@ -52,11 +52,6 @@ def view(
     n_channels = len(ch_names)
     sfreq = stream.info["sfreq"]
 
-    # Data buffer
-    max_samples = int(window_size * sfreq)
-    data_buffer = np.zeros((n_channels, max_samples))
-    time_buffer = np.arange(-max_samples, 0) / sfreq
-
     # Setup the plot
     fig, axes = plt.subplots(n_channels, 1, figsize=(12, 8), sharex=True)
     if n_channels == 1:
@@ -67,7 +62,9 @@ def view(
     lines = []
     rate_texts = []  # Text annotations for sampling rates
     for i, (ax, ch_name) in enumerate(zip(axes, ch_names)):
-        (line,) = ax.plot(time_buffer, data_buffer[i, :], lw=1)
+        # Initialize with empty data - will be updated with actual timestamps
+        # Use '-' line style explicitly and no markers
+        (line,) = ax.plot([], [], "-", lw=1, marker="")
         lines.append(line)
         ax.set_ylabel(ch_name, fontsize=10)
         ax.grid(True, alpha=0.3)
@@ -92,19 +89,21 @@ def view(
     start_time = time.time()
     samples_received = 0
 
-    # Track ALL timestamps for final statistics (never pruned)
+    # Track ALL timestamps for final statistics
     all_timestamps = []
 
-    # Track recent timestamps for real-time rate display
+    # Track recent timestamps for rate calculation (keep last 52 samples)
     recent_timestamps = []
-    rate_window = 1.0  # Calculate rate over last 1 second
+    max_timestamps_for_rate = 52
 
     def update(frame):
         nonlocal samples_received, recent_timestamps, all_timestamps
 
-        # Pull new data from the stream
+        # Get the last window_size seconds of data directly from the stream buffer
+        # This is the cleanest approach - let MNE-LSL handle the buffering
         try:
-            data, timestamps = stream.get_data()
+            # Get data from the stream's internal buffer
+            data, timestamps = stream.get_data(winsize=window_size)
         except Exception:
             return lines + rate_texts
 
@@ -113,36 +112,22 @@ def view(
 
         samples_received += data.shape[1]
 
-        # Update timestamp tracking
+        # Update timestamp tracking for rate calculation
         if len(timestamps) > 0:
-            ts_list = timestamps.tolist()
+            # For final statistics, keep all unique timestamps we've seen
+            all_timestamps.extend(timestamps.tolist())
 
-            # Keep ALL timestamps for final statistics
-            all_timestamps.extend(ts_list)
+            # For rate calculation, keep only the most recent timestamps
+            recent_timestamps.extend(timestamps.tolist())
+            if len(recent_timestamps) > max_timestamps_for_rate:
+                recent_timestamps = recent_timestamps[-max_timestamps_for_rate:]
 
-            # Keep recent timestamps for real-time rate display
-            recent_timestamps.extend(ts_list)
-
-            # Remove timestamps older than rate_window for real-time display
-            if len(recent_timestamps) > 0:
-                cutoff_time = recent_timestamps[-1] - rate_window
-                recent_timestamps = [t for t in recent_timestamps if t >= cutoff_time]
-
-        # Update buffer with new data
-        n_new = data.shape[1]
-        if n_new >= max_samples:
-            # If more data than buffer, just take the last max_samples
-            data_buffer[:] = data[:, -max_samples:]
-        else:
-            # Shift old data and append new
-            data_buffer[:, :-n_new] = data_buffer[:, n_new:]
-            data_buffer[:, -n_new:] = data
-
-        # Calculate current sampling rate
-        if len(recent_timestamps) > 1:
+        # Calculate mean effective sampling rate from last 52 samples
+        if len(recent_timestamps) >= 2:
             time_span = recent_timestamps[-1] - recent_timestamps[0]
+            num_intervals = len(recent_timestamps) - 1
             if time_span > 0:
-                current_rate = (len(recent_timestamps) - 1) / time_span
+                current_rate = num_intervals / time_span
             else:
                 current_rate = 0.0
         else:
@@ -150,12 +135,28 @@ def view(
 
         # Update plots and rate displays
         for i, (line, rate_text) in enumerate(zip(lines, rate_texts)):
-            line.set_ydata(data_buffer[i, :])
-            # Auto-scale y-axis
-            y_min, y_max = data_buffer[i, :].min(), data_buffer[i, :].max()
-            y_range = y_max - y_min
-            if y_range > 0:
-                axes[i].set_ylim(y_min - 0.1 * y_range, y_max + 0.1 * y_range)
+            if len(timestamps) > 0:
+                # Convert to relative times (most recent sample = 0)
+                latest_time = timestamps[-1]
+                relative_times = timestamps - latest_time
+
+                # Get this channel's data
+                channel_data = data[i, :]
+
+                # Plot the data
+                line.set_data(relative_times, channel_data)
+
+                # Auto-scale y-axis
+                if len(channel_data) > 0:
+                    y_min, y_max = channel_data.min(), channel_data.max()
+                    y_range = y_max - y_min
+                    if y_range > 0:
+                        axes[i].set_ylim(y_min - 0.1 * y_range, y_max + 0.1 * y_range)
+                    else:
+                        axes[i].set_ylim(y_min - 0.1, y_max + 0.1)
+            else:
+                # No data, clear the line
+                line.set_data([], [])
 
             # Update rate text
             rate_text.set_text(f"{current_rate:.1f} Hz")
@@ -187,14 +188,31 @@ def view(
             print(f"  Duration: {elapsed:.1f} seconds")
             print(f"  Samples received: {samples_received}")
 
-            # Calculate average rate from all collected LSL timestamps
-            if len(all_timestamps) > 1:
-                lsl_duration = all_timestamps[-1] - all_timestamps[0]
-                if lsl_duration > 0:
-                    avg_rate = (len(all_timestamps) - 1) / lsl_duration
-                    print(f"  Average rate: {avg_rate:.1f} Hz (from LSL timestamps)")
-                    print(f"  Data time span: {lsl_duration:.1f} seconds")
+            # Calculate mean effective sampling rate (includes gaps)
+            if len(all_timestamps) >= 2:
+                # Mean rate = total samples / total time span
+                time_span = all_timestamps[-1] - all_timestamps[0]
+                num_samples = len(all_timestamps)
+                if time_span > 0:
+                    avg_rate = (num_samples - 1) / time_span
+                    print(
+                        f"  Mean effective rate: {avg_rate:.1f} Hz (includes gaps between packets)"
+                    )
+                    print(f"  Data time span: {time_span:.1f} seconds")
+
+                    # Also show instantaneous rate (median of differences, ignores gaps)
+                    all_diffs = [
+                        all_timestamps[i + 1] - all_timestamps[i]
+                        for i in range(len(all_timestamps) - 1)
+                    ]
+                    all_diffs_sorted = sorted(all_diffs)
+                    median_diff = all_diffs_sorted[len(all_diffs_sorted) // 2]
+                    if median_diff > 0:
+                        instant_rate = 1.0 / median_diff
+                        print(
+                            f"  Instantaneous rate: {instant_rate:.1f} Hz (median, ignores gaps)"
+                        )
                 else:
-                    print(f"  Average rate: N/A (insufficient data)")
+                    print(f"  Average rate: N/A (zero time span)")
             else:
                 print(f"  Average rate: N/A (no timestamps received)")

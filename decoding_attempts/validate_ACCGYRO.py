@@ -6,8 +6,9 @@ from MuseLSL3.decode import parse_message
 
 with open("../tests/test_data/test_accgyro.txt", "r", encoding="utf-8") as f:
     messages = f.readlines()
-packets = [parse_message(m) for m in messages]
+packets = [parse_message(m, parse_leftovers=True) for m in messages]
 print(f"Total packets: {len(packets)}")
+
 
 # Extract battery data - now each packet can have multiple battery readings
 battery_data = []
@@ -35,20 +36,26 @@ for pkt in packets:
             for acc_array in p["data_accgyro"]:
                 accgyro_data.append(acc_array)
 
-if accgyro_data:
-    # Concatenate all arrays vertically (stack samples)
-    accgyro = np.vstack(accgyro_data)
-    accgyro = pd.DataFrame(
-        accgyro,
-        columns=["time", "ACC_X", "ACC_Y", "ACC_Z", "GYRO_X", "GYRO_Y", "GYRO_Z"],
-    )
-    accgyro.plot(
-        x="time",
-        y=["ACC_X", "ACC_Y", "ACC_Z", "GYRO_X", "GYRO_Y", "GYRO_Z"],
-        subplots=True,
-        title="ACCGYRO Data",
-    )
-    print(f"ACCGYRO samples: {len(accgyro)}")
-    print(f"Effective ACCGYRO sampling rate: {len(accgyro) / 90:.2f} Hz")
-else:
-    print("No ACCGYRO data found")
+# Concatenate all arrays vertically (stack samples)
+accgyro = np.vstack(accgyro_data)
+accgyro = pd.DataFrame(
+    accgyro,
+    columns=["time", "ACC_X", "ACC_Y", "ACC_Z", "GYRO_X", "GYRO_Y", "GYRO_Z"],
+)
+accgyro.plot(
+    x="time",
+    y=["ACC_X", "ACC_Y", "ACC_Z", "GYRO_X", "GYRO_Y", "GYRO_Z"],
+    subplots=True,
+    title="ACCGYRO Data",
+)
+print(f"ACCGYRO samples: {len(accgyro)}")
+print(f"Effective ACCGYRO sampling rate: {len(accgyro) / 90:.2f} Hz")
+
+
+# Investigate timestamps
+# Time elapsed
+accgyro["time"].iloc[-1] - accgyro["time"].iloc[0]
+accgyro["time"].diff().hist(bins=50)
+accgyro.iloc[100:150].plot(
+    x="time", y=["ACC_X", "ACC_Y", "ACC_Z", "GYRO_X", "GYRO_Y", "GYRO_Z"], subplots=True
+)

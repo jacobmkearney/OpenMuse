@@ -87,6 +87,21 @@ async def _stream_async(
 
         # ACC and GYRO should have the same number of samples
         num_samples = min(len(acc_entries), len(gyro_entries))
+
+        # Get LSL timestamp for this BLE packet to establish device-to-LSL time mapping
+        from mne_lsl.lsl import local_clock
+
+        lsl_now = local_clock()
+
+        # Use the first sample's device timestamp to compute the offset
+        # This maps device time (device uptime in seconds) to LSL time
+        device_to_lsl_offset = 0.0  # Initialize default offset
+        if num_samples > 0:
+            device_time_first = acc_entries[0].get("time", None)
+            if device_time_first is not None:
+                # Calculate offset: LSL_time = device_time + offset
+                device_to_lsl_offset = lsl_now - device_time_first
+
         for i in range(num_samples):
             acc_x = acc_entries[i].get("ACC_X", 0.0)
             acc_y = acc_entries[i].get("ACC_Y", 0.0)
@@ -100,13 +115,17 @@ async def _stream_async(
                 dtype=np.float32,
             )
 
-            # Push to LSL and capture timestamp
+            # Use actual device timestamp for LSL timestamp
             lsl_timestamp = None
             try:
-                # Push sample and capture the LSL timestamp
-                from mne_lsl.lsl import local_clock
+                device_time = acc_entries[i].get("time", None)
+                if device_time is not None:
+                    # Convert device time to LSL time using the offset
+                    lsl_timestamp = device_time + device_to_lsl_offset
+                else:
+                    # Fallback to current LSL time if device time is missing
+                    lsl_timestamp = local_clock()
 
-                lsl_timestamp = local_clock()
                 outlet.push_sample(sample, lsl_timestamp)
                 samples_sent += 1
                 if not stream_started.is_set():
