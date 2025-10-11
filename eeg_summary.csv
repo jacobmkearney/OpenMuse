@@ -1,0 +1,4 @@
+preset,EEG id,dominant payload length,multiple-of-28/56,est samples/packet
+p1035,0x11,222,—,32
+p1041,0x12,226,—,16
+p1045,0x12,226,—,16
