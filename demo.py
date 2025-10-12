@@ -1,3 +1,4 @@
+# OpenMuse record --address 00:55:DA:B9:FA:20 --duration 90 --outfile test_eeg_quality.txt
 # OpenMuse stream --address 00:55:DA:B9:FA:20
 # OpenMuse view
 
