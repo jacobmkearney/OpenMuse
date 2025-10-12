@@ -33,11 +33,11 @@ def view(
     # Connect to the LSL stream
     try:
         stream = StreamLSL(bufsize=window_size, name=stream_name)
-        stream.connect()
+        stream.connect(timeout=5.0)  # 5 second timeout for better error messages
     except Exception as exc:
         print(f"Error: Could not connect to LSL stream '{stream_name}': {exc}")
         print("\nMake sure the stream is running in another terminal:")
-        print(f"  MuseLSL3 stream --address <MAC> --preset <PRESET>")
+        print(f"  OpenMuse stream --address <MAC> --preset <PRESET>")
         return
 
     if verbose:
@@ -87,17 +87,12 @@ def view(
     plt.tight_layout()
 
     start_time = time.time()
-    samples_received = 0
-
-    # Track ALL timestamps for final statistics
-    all_timestamps = []
-
-    # Track recent timestamps for rate calculation (keep last 52 samples)
-    recent_timestamps = []
-    max_timestamps_for_rate = 52
+    first_timestamp = None
+    last_timestamp = None
+    total_samples = 0  # Track unique samples based on timestamp range
 
     def update(frame):
-        nonlocal samples_received, recent_timestamps, all_timestamps
+        nonlocal first_timestamp, last_timestamp, total_samples
 
         # Get the last window_size seconds of data directly from the stream buffer
         # This is the cleanest approach - let MNE-LSL handle the buffering
@@ -110,28 +105,36 @@ def view(
         if data.shape[1] == 0:
             return lines + rate_texts
 
-        samples_received += data.shape[1]
-
-        # Update timestamp tracking for rate calculation
+        # Track first and last timestamps for final statistics
         if len(timestamps) > 0:
-            # For final statistics, keep all unique timestamps we've seen
-            all_timestamps.extend(timestamps.tolist())
+            if first_timestamp is None:
+                first_timestamp = timestamps[0]
+            last_timestamp = timestamps[-1]
 
-            # For rate calculation, keep only the most recent timestamps
-            recent_timestamps.extend(timestamps.tolist())
-            if len(recent_timestamps) > max_timestamps_for_rate:
-                recent_timestamps = recent_timestamps[-max_timestamps_for_rate:]
+            # Calculate total unique samples from timestamp range and sampling rate
+            if first_timestamp is not None and last_timestamp is not None:
+                time_span = last_timestamp - first_timestamp
+                if sfreq > 0:
+                    total_samples = int(time_span * sfreq) + 1
+                else:
+                    # Fallback: count unique timestamps seen so far
+                    total_samples = len(timestamps)
 
-        # Calculate mean effective sampling rate from last 52 samples
-        if len(recent_timestamps) >= 2:
-            time_span = recent_timestamps[-1] - recent_timestamps[0]
-            num_intervals = len(recent_timestamps) - 1
-            if time_span > 0:
-                current_rate = num_intervals / time_span
-            else:
-                current_rate = 0.0
-        else:
-            current_rate = 0.0
+        # Calculate instantaneous sampling rate from the window data
+        # Use last ~1 second of data (or all available data if less)
+        current_rate = 0.0
+        if len(timestamps) >= 2:
+            # For rate calculation, use recent data (last 1 second or 52 samples)
+            rate_window_size = min(1.0, window_size)  # Use 1 second or less
+            rate_window_samples = int(sfreq * rate_window_size) if sfreq > 0 else 52
+            recent_start_idx = max(0, len(timestamps) - rate_window_samples)
+            recent_timestamps = timestamps[recent_start_idx:]
+
+            if len(recent_timestamps) >= 2:
+                time_span = recent_timestamps[-1] - recent_timestamps[0]
+                num_intervals = len(recent_timestamps) - 1
+                if time_span > 0:
+                    current_rate = num_intervals / time_span
 
         # Update plots and rate displays
         for i, (line, rate_text) in enumerate(zip(lines, rate_texts)):
@@ -186,33 +189,16 @@ def view(
             elapsed = time.time() - start_time
             print(f"\nVisualization stopped.")
             print(f"  Duration: {elapsed:.1f} seconds")
-            print(f"  Samples received: {samples_received}")
+            print(f"  Total samples: {total_samples}")
 
-            # Calculate mean effective sampling rate (includes gaps)
-            if len(all_timestamps) >= 2:
-                # Mean rate = total samples / total time span
-                time_span = all_timestamps[-1] - all_timestamps[0]
-                num_samples = len(all_timestamps)
-                if time_span > 0:
-                    avg_rate = (num_samples - 1) / time_span
-                    print(
-                        f"  Mean effective rate: {avg_rate:.1f} Hz (includes gaps between packets)"
-                    )
+            # Calculate mean effective sampling rate from first to last timestamp
+            if first_timestamp is not None and last_timestamp is not None:
+                time_span = last_timestamp - first_timestamp
+                if time_span > 0 and total_samples > 0:
+                    avg_rate = (total_samples - 1) / time_span
+                    print(f"  Mean effective rate: {avg_rate:.1f} Hz")
                     print(f"  Data time span: {time_span:.1f} seconds")
-
-                    # Also show instantaneous rate (median of differences, ignores gaps)
-                    all_diffs = [
-                        all_timestamps[i + 1] - all_timestamps[i]
-                        for i in range(len(all_timestamps) - 1)
-                    ]
-                    all_diffs_sorted = sorted(all_diffs)
-                    median_diff = all_diffs_sorted[len(all_diffs_sorted) // 2]
-                    if median_diff > 0:
-                        instant_rate = 1.0 / median_diff
-                        print(
-                            f"  Instantaneous rate: {instant_rate:.1f} Hz (median, ignores gaps)"
-                        )
                 else:
-                    print(f"  Average rate: N/A (zero time span)")
+                    print(f"  Average rate: N/A (insufficient data)")
             else:
                 print(f"  Average rate: N/A (no timestamps received)")
