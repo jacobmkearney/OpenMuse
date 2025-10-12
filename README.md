@@ -7,6 +7,8 @@
 
 This software allows recording, streaming via LSL and visualizing signals from the **Muse S Athena** headband.
 
+> [!WARNING]  
+> OpenMuse is NOT an official product of InteraXon Inc and is not affiliated with or endorsed by the company. It does not come with any warranty and should be considered an experimental software developed for research purposes only.
 
 ## Installation
 

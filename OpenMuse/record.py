@@ -14,7 +14,7 @@ async def _record_async(
     address: str,
     duration: float,
     outfile: str,
-    preset: str = "p1035",
+    preset: str = "p1041",
     subscribe_chars: Optional[Iterable[str]] = None,
     verbose: bool = True,
 ) -> None:
@@ -119,7 +119,7 @@ def record(
     address: str,
     duration: float = 30.0,
     outfile: str = "muse_record.txt",
-    preset: str = "p1035",
+    preset: str = "p1041",
     verbose: bool = True,
 ) -> None:
     """
@@ -131,7 +131,7 @@ def record(
     - address: Device MAC address (Windows) or identifier (platform-dependent).
     - duration: Recording duration in seconds.
     - outfile: Path to output text file.
-    - preset: Preset string to send (e.g., "p1035" or "p21").
+    - preset: Preset string to send (e.g., "p1031" or "p21").
     - verbose: Print progress messages.
     """
     if not address:

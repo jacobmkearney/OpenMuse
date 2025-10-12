@@ -154,126 +154,94 @@ async def _stream_async(
             if verbose:
                 print("Connected. Subscribing and configuring ...")
 
-            # ACC/GYRO data is multiplexed with EEG in the EEG characteristic
-            # Subscribe to both characteristics to maintain connection
-            def _on_other(_, data: bytearray):
-                # OTHER characteristic may have additional data, ignore for now
-                pass
+            # Build callbacks dict for all data characteristics
+            data_callbacks = {MuseS.EEG_UUID: _on_data}
 
-            data_callbacks = {
-                MuseS.EEG_UUID: _on_data,
-                MuseS.OTHER_UUID: _on_other,
-            }
+            # Use shared connection routine
             await MuseS.connect_and_initialize(client, preset, data_callbacks, verbose)
 
+            # Wait briefly for streaming to start before declaring success
             if verbose:
-                print("Waiting for motion packets (up to 3.0s)...")
+                print("Waiting for streaming to start (up to 3.0s)...")
             try:
                 await asyncio.wait_for(stream_started.wait(), timeout=3.0)
+                if verbose:
+                    print("Streaming started.")
             except asyncio.TimeoutError:
                 if verbose:
-                    print("Warning: no motion data received within 3.0s.")
+                    print(
+                        "Warning: no data received within 3.0s; will continue up to timeout."
+                    )
 
-            if duration is None:
+            if duration:
                 if verbose:
-                    print("Streaming acc/gyro indefinitely. Press Ctrl+C to stop.")
+                    print(f"Streaming for {duration} seconds...")
+                start = time.time()
+                try:
+                    while time.time() - start < duration:
+                        await asyncio.sleep(0.05)
+                except asyncio.CancelledError:
+                    pass
             else:
-                if duration <= 0:
-                    raise ValueError("duration must be positive")
                 if verbose:
-                    print(f"Streaming acc/gyro for {duration:.1f} seconds ...")
+                    print("Streaming indefinitely. Press Ctrl+C to stop.")
+                try:
+                    while True:
+                        await asyncio.sleep(1)
+                except asyncio.CancelledError:
+                    pass
 
-            stop_at = None if duration is None else time.monotonic() + duration
-            try:
-                while True:
-                    if stop_at is not None and time.monotonic() >= stop_at:
-                        break
-                    await asyncio.sleep(0.1)
-            except asyncio.CancelledError:
-                pass
-            finally:
-                # Try to stop streaming gracefully
-                await MuseS.stop_streaming(client, verbose)
-
-            # Unsubscribe from all characteristics
-            try:
-                await client.stop_notify(MuseS.EEG_UUID)
-            except Exception:
-                pass
-            try:
-                await client.stop_notify(MuseS.OTHER_UUID)
-            except Exception:
-                pass
-            try:
-                await client.stop_notify(MuseS.CONTROL_UUID)
-            except Exception:
-                pass
-
+    except asyncio.CancelledError:
+        if verbose:
+            print("Stream cancelled.")
+    except Exception as exc:
+        if verbose:
+            print(f"An error occurred: {exc}")
     finally:
-        # Write JSON data to file if accumulated
-        if json_data is not None and outfile:
+        if verbose:
+            print("Stopping stream...")
+        del outlet
+        if json_data and outfile:
+            if verbose:
+                print(f"Writing {samples_written} samples to {outfile}...")
             try:
+                # Ensure output directory exists
                 outdir = os.path.dirname(os.path.abspath(outfile))
                 if outdir and not os.path.exists(outdir):
                     os.makedirs(outdir, exist_ok=True)
-            except Exception:
-                pass
-
-            try:
                 with open(outfile, "w", encoding="utf-8") as f:
                     json.dump(json_data, f, indent=2)
                 if verbose:
-                    print(f"Wrote {samples_written} samples to {outfile}")
+                    print("File written successfully.")
             except Exception as exc:
                 if verbose:
-                    print(f"Failed to write JSON file: {exc}")
+                    print(f"Error writing to file: {exc}")
 
         if verbose:
-            msg = f"Stopped streaming. Sent {samples_sent} ACC+GYRO samples."
-            if json_data is not None:
-                msg += f" Saved {samples_written} samples."
-            print(msg)
+            print(f"Stream stopped. Total samples sent: {samples_sent}")
 
 
 def stream(
     address: str,
-    preset: str = "p1035",
+    preset: str = "p1041",
     duration: Optional[float] = None,
     outfile: Optional[str] = None,
     verbose: bool = True,
 ) -> None:
     """
-    Connect to a Muse, decode acc/gyro data, and stream over LSL using mne-lsl.
-
-    Creates a single LSL outlet named "MuseAccGyro" with 6 channels:
-    ACC_X, ACC_Y, ACC_Z, GYRO_X, GYRO_Y, GYRO_Z at 52 Hz nominal rate.
+    Stream decoded accelerometer and gyroscope data over LSL.
 
     Parameters
     ----------
     address : str
-        Device MAC/identifier for the Muse headset.
+        Device address (e.g., MAC on Windows).
     preset : str
-        Preset token to send before streaming (default ``"p1035"``).
-    duration : float | None
-        Optional stream length in seconds. ``None`` streams until interrupted.
-    outfile : str | None
-        Optional file path to save decoded ACC/GYRO samples. ``None`` streams only.
-        File format: JSON with dict structure:
-            {"ACC": {"time": [...], "time_lsl": [...], "ACC_X": [...], "ACC_Y": [...], "ACC_Z": [...]},
-             "GYRO": {"time": [...], "time_lsl": [...], "GYRO_X": [...], "GYRO_Y": [...], "GYRO_Z": [...]}}
-        where 'time' is device timestamp and 'time_lsl' is LSL timestamp for synchronization.
+        Preset to send (e.g., p1035 or p21).
+    duration : float, optional
+        Optional stream duration in seconds. Omit to stream until interrupted.
+    outfile : str, optional
+        Optional output file to save decoded ACC/GYRO samples. Omit to only stream.
     verbose : bool
-        Whether to print progress messages.
+        If True, print verbose output.
     """
-    if not address:
-        raise ValueError("address must be a non-empty string")
-
-    return _run(
-        _stream_async(
-            address=address,
-            preset=preset,
-            duration=duration,
-            outfile=outfile,
-            verbose=verbose,
-        )
-    )
+    _run(_stream_async(address, preset, duration, outfile, verbose))

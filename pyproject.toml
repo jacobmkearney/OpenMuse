@@ -24,3 +24,6 @@ classifiers = [
 
 [project.scripts]
 OpenMuse = "OpenMuse.cli:main"
+
+[tool.setuptools]
+packages = ["OpenMuse"]
