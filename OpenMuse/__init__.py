@@ -1,4 +1,4 @@
-"""MuseLSL3: Minimal utilities for Muse EEG devices."""
+"""OpenMuse: Minimal utilities for Muse EEG devices."""
 
 from .find import find_devices
 from .record import record

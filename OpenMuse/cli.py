@@ -47,7 +47,7 @@ def main(argv=None):
         "--outfile", "-o", default="muse_record.txt", help="Output text file path"
     )
     p_rec.add_argument(
-        "--preset", default="p1035", help="Preset to send (e.g., p1035 or p21)"
+        "--preset", default="p1041", help="Preset to send (by default, p1041)"
     )
 
     def handle_record(ns):
@@ -76,8 +76,8 @@ def main(argv=None):
     )
     p_stream.add_argument(
         "--preset",
-        default="p1035",
-        help="Preset to send (e.g., p1035 or p21)",
+        default="p1041",
+        help="Preset to send (by default, p1041)",
     )
     p_stream.add_argument(
         "--duration",

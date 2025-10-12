@@ -1,12 +1,12 @@
 import numpy as np
 import pandas as pd
 
-from MuseLSL3.decode import decode_rawdata
+import OpenMuse
 import matplotlib.pyplot as plt
 
 with open("tests/test_data/test_accgyro.txt", "r", encoding="utf-8") as f:
     messages = f.readlines()
-data = decode_rawdata(messages)
+data = OpenMuse.decode_rawdata(messages)
 
 data["ACCGYRO"]["time"] = data["ACCGYRO"]["time"] - data["ACCGYRO"]["time"].iloc[0]
 

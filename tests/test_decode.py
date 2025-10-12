@@ -8,7 +8,7 @@ The new decoder returns numpy arrays with timestamps instead of lists of dicts.
 import unittest
 import os
 import numpy as np
-from MuseLSL3.decode import parse_message, decode_rawdata, SENSORS
+from OpenMuse.decode import parse_message, decode_rawdata, SENSORS
 
 
 class TestParseMessage(unittest.TestCase):

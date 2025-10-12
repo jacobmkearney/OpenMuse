@@ -1,6 +1,6 @@
 import unittest
 
-from MuseLSL3.muse import MuseS
+from OpenMuse.muse import MuseS
 
 
 class EncodeCommandTests(unittest.TestCase):
