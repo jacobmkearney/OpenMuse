@@ -67,7 +67,7 @@ def main(argv=None):
     # stream subcommand
     p_stream = subparsers.add_parser(
         "stream",
-        help="Stream decoded accelerometer and gyroscope data over LSL",
+        help="Stream decoded EEG and accelerometer/gyroscope data over LSL",
     )
     p_stream.add_argument(
         "--address",
@@ -77,7 +77,7 @@ def main(argv=None):
     p_stream.add_argument(
         "--preset",
         default="p1041",
-        help="Preset to send (by default, p1041)",
+        help="Preset to send (default: p1041 for all channels including EEG)",
     )
     p_stream.add_argument(
         "--duration",
@@ -90,7 +90,7 @@ def main(argv=None):
         "--outfile",
         "-o",
         default=None,
-        help="Optional output file to save decoded ACC/GYRO samples. Omit to only stream.",
+        help="Optional output JSON file to save decoded EEG and ACC/GYRO samples. Omit to only stream.",
     )
 
     def handle_stream(ns):
@@ -112,12 +112,12 @@ def main(argv=None):
     # view subcommand
     p_view = subparsers.add_parser(
         "view",
-        help="Visualize ACC/GYRO data from an LSL stream in real-time",
+        help="Visualize EEG and ACC/GYRO data from LSL streams in real-time",
     )
     p_view.add_argument(
         "--stream-name",
-        default="MuseAccGyro",
-        help="Name of the LSL stream to visualize (default: MuseAccGyro)",
+        default=None,
+        help="Name of specific LSL stream to visualize (default: None = show all available streams: Muse_EEG + Muse_ACCGYRO)",
     )
     p_view.add_argument(
         "--window",
@@ -141,6 +141,7 @@ def main(argv=None):
             parser.error("--window must be positive")
         if ns.duration is not None and ns.duration <= 0:
             parser.error("--duration must be positive when provided")
+
         view(
             stream_name=ns.stream_name,
             duration=ns.duration,

@@ -15,27 +15,51 @@ from .muse import MuseS
 from mne_lsl.lsl import StreamInfo, StreamOutlet
 
 
-def _build_outlet():
+def _build_outlets():
+    """Build LSL outlets for EEG and ACC/GYRO data."""
 
-    # Create a single 6-channel outlet for ACC+GYRO data
-    labels = ("ACC_X", "ACC_Y", "ACC_Z", "GYRO_X", "GYRO_Y", "GYRO_Z")
-    info = StreamInfo(
-        name="MuseAccGyro",
+    # EEG outlet - 4 channels at 256 Hz
+    eeg_labels = ("TP9", "AF7", "AF8", "TP10")
+    eeg_info = StreamInfo(
+        name="Muse_EEG",
+        stype="EEG",
+        n_channels=4,
+        sfreq=256.0,
+        dtype="float32",
+        source_id="Muse_EEG",
+    )
+    eeg_desc = eeg_info.desc
+    eeg_desc.append_child_value("manufacturer", "Muse")
+    eeg_channels = eeg_desc.append_child("channels")
+    for label in eeg_labels:
+        channel = eeg_channels.append_child("channel")
+        channel.append_child_value("label", label)
+        channel.append_child_value("unit", "microvolts")
+        channel.append_child_value("type", "EEG")
+
+    eeg_outlet = StreamOutlet(eeg_info, chunk_size=1)
+
+    # ACC+GYRO outlet - 6 channels at 52 Hz
+    accgyro_labels = ("ACC_X", "ACC_Y", "ACC_Z", "GYRO_X", "GYRO_Y", "GYRO_Z")
+    accgyro_info = StreamInfo(
+        name="Muse_ACCGYRO",
         stype="Motion",
         n_channels=6,
         sfreq=52.0,
         dtype="float32",
-        source_id="MuseAccGyro",
+        source_id="Muse_ACCGYRO",
     )
-    desc = info.desc
-    desc.append_child_value("manufacturer", "Muse")
-    channels = desc.append_child("channels")
-    for label in labels:
-        channel = channels.append_child("channel")
+    accgyro_desc = accgyro_info.desc
+    accgyro_desc.append_child_value("manufacturer", "Muse")
+    accgyro_channels = accgyro_desc.append_child("channels")
+    for label in accgyro_labels:
+        channel = accgyro_channels.append_child("channel")
         channel.append_child_value("label", label)
         channel.append_child_value("unit", "a.u.")
 
-    return StreamOutlet(info, chunk_size=1)
+    accgyro_outlet = StreamOutlet(accgyro_info, chunk_size=1)
+
+    return eeg_outlet, accgyro_outlet
 
 
 async def _stream_async(
@@ -46,39 +70,48 @@ async def _stream_async(
     verbose: bool,
 ) -> None:
     stream_started = asyncio.Event()
-    outlet = _build_outlet()
-    samples_sent = 0
+    eeg_outlet, accgyro_outlet = _build_outlets()
+    samples_sent = {"EEG": 0, "ACCGYRO": 0}
     samples_written = 0
 
     # Compute device-to-LSL time offset once at the start
     # Will be updated with the first data packet
     device_to_lsl_offset = None
 
-    # Reordering buffer to handle out-of-order BLE messages
+    # Reordering buffers for both EEG and ACC/GYRO data
     # Stores (lsl_timestamp, chunk_data) tuples
-    reorder_buffer = []
-    buffer_duration = 0.2  # Hold samples for 200ms to allow reordering (BLE can be delayed up to ~40ms)
-    last_push_time = None
+    eeg_buffer = []
+    accgyro_buffer = []
+    buffer_duration = 0.12  # Hold samples for 120ms to allow reordering (BLE can be delayed up to ~40ms)
+    last_push_time = {"EEG": 0.0, "ACCGYRO": 0.0}
 
     def _ts() -> str:
         return datetime.now(timezone.utc).isoformat()
 
     # Collect LSL data for JSON output (exactly what gets pushed to LSL)
     # This will be populated during _flush_buffer() calls
-    lsl_data_log = [] if outfile else None  # List of (timestamps, data) after sorting
+    lsl_data_log = {"EEG": [], "ACCGYRO": []} if outfile else None
 
-    def _flush_buffer():
-        """Flush reordering buffer: sort and push samples to LSL."""
-        nonlocal samples_sent, reorder_buffer, last_push_time
+    def _flush_buffer(sensor_type: str):
+        """Flush reordering buffer for a specific sensor type: sort and push samples to LSL."""
+        nonlocal samples_sent, eeg_buffer, accgyro_buffer, last_push_time
 
-        if len(reorder_buffer) == 0:
+        # Select appropriate buffer and outlet
+        if sensor_type == "EEG":
+            buffer = eeg_buffer
+            outlet = eeg_outlet
+        else:  # ACCGYRO
+            buffer = accgyro_buffer
+            outlet = accgyro_outlet
+
+        if len(buffer) == 0:
             return
 
         from mne_lsl.lsl import local_clock
 
         # Flatten all buffered samples into a single list
         all_samples = []  # List of (timestamp, data_row) tuples
-        for timestamps, chunk in reorder_buffer:
+        for timestamps, chunk in buffer:
             for i, ts in enumerate(timestamps):
                 all_samples.append((ts, chunk[i, :]))
 
@@ -92,23 +125,25 @@ async def _stream_async(
         # Push to LSL
         try:
             outlet.push_chunk(combined_chunk, timestamp=combined_timestamps, pushThrough=True)  # type: ignore[arg-type]
-            samples_sent += len(combined_timestamps)
+            samples_sent[sensor_type] += len(combined_timestamps)
 
             # Log to JSON if requested - save exactly what was pushed to LSL
             if lsl_data_log is not None:
-                lsl_data_log.append((combined_timestamps.copy(), combined_chunk.copy()))
+                lsl_data_log[sensor_type].append(
+                    (combined_timestamps.copy(), combined_chunk.copy())
+                )
         except Exception as exc:
             if verbose:
-                print(f"LSL push_chunk failed: {exc}")
+                print(f"LSL push_chunk failed for {sensor_type}: {exc}")
 
         # Clear buffer and update last push time
-        reorder_buffer.clear()
-        last_push_time = local_clock()
+        buffer.clear()
+        last_push_time[sensor_type] = local_clock()
 
     def _on_data(_, data: bytearray):
-        nonlocal samples_sent, samples_written, device_to_lsl_offset, reorder_buffer, last_push_time
+        nonlocal samples_sent, samples_written, device_to_lsl_offset, eeg_buffer, accgyro_buffer, last_push_time
         try:
-            # ACC/GYRO data comes through EEG characteristic, not OTHER
+            # Both EEG and ACC/GYRO data come through EEG characteristic
             message = f"{_ts()}\t{MuseS.EEG_UUID}\t{data.hex()}"
             decoded = parse_message(message)
         except Exception as exc:
@@ -116,47 +151,80 @@ async def _stream_async(
                 print(f"Decoding error: {exc}")
             return
 
-        # Get ACCGYRO data (numpy array with shape (n_samples, 7): time + 6 channels)
-        accgyro_data = decoded.get("ACCGYRO", np.empty((0, 0)))
-
-        if accgyro_data.size == 0:
-            return
-
-        num_samples = accgyro_data.shape[0]
-
-        # Get LSL timestamp for this BLE packet arrival
         from mne_lsl.lsl import local_clock
 
         lsl_now = local_clock()
 
-        # Compute device-to-LSL time offset on first packet only
-        if device_to_lsl_offset is None and num_samples > 0:
-            device_time_first = accgyro_data[0, 0]  # First column is time
-            # Calculate offset: LSL_time = device_time + offset
-            device_to_lsl_offset = lsl_now - device_time_first
-            if verbose:
-                print(f"Initialized time offset: {device_to_lsl_offset:.3f} seconds")
+        # Process EEG data
+        eeg_data = decoded.get("EEG", np.empty((0, 0)))
+        if eeg_data.size > 0 and eeg_data.shape[1] >= 5:  # time + 4 EEG channels
+            num_samples = eeg_data.shape[0]
 
-        # Prepare chunk data
-        # Extract sensor data (exclude time column): shape (n_samples, 6)
-        chunk = accgyro_data[:, 1:].astype(np.float32)
+            # Compute device-to-LSL time offset on first packet only
+            if device_to_lsl_offset is None:
+                device_time_first = eeg_data[0, 0]  # First column is time
+                # Calculate offset: LSL_time = device_time + offset
+                device_to_lsl_offset = lsl_now - device_time_first
+                if verbose:
+                    print(
+                        f"Initialized time offset: {device_to_lsl_offset:.3f} seconds"
+                    )
 
-        # Calculate LSL timestamps for all samples
-        device_times = accgyro_data[:, 0]
-        lsl_timestamps = (device_times + device_to_lsl_offset).tolist()
+            # Extract EEG sensor data (exclude time column, keep only first 4 channels): shape (n_samples, 4)
+            eeg_chunk = eeg_data[:, 1:5].astype(np.float32)
 
-        # Add to reordering buffer
-        reorder_buffer.append((lsl_timestamps, chunk))
+            # Calculate LSL timestamps for all samples
+            device_times = eeg_data[:, 0]
+            lsl_timestamps = (device_times + device_to_lsl_offset).tolist()
 
-        # Set last_push_time on first data
-        if last_push_time is None:
-            last_push_time = lsl_now
-            if not stream_started.is_set():
-                stream_started.set()
+            # Add to EEG reordering buffer
+            eeg_buffer.append((lsl_timestamps, eeg_chunk))
 
-        # Flush buffer if enough time has passed
-        if lsl_now - last_push_time >= buffer_duration:
-            _flush_buffer()
+            # Set last_push_time on first data
+            if last_push_time["EEG"] is None:
+                last_push_time["EEG"] = lsl_now
+                if not stream_started.is_set():
+                    stream_started.set()
+
+            # Flush buffer if enough time has passed
+            if lsl_now - last_push_time["EEG"] >= buffer_duration:
+                _flush_buffer("EEG")
+
+        # Process ACCGYRO data
+        accgyro_data = decoded.get("ACCGYRO", np.empty((0, 0)))
+        if accgyro_data.size > 0:
+            num_samples = accgyro_data.shape[0]
+
+            # Compute device-to-LSL time offset on first packet only
+            if device_to_lsl_offset is None and num_samples > 0:
+                device_time_first = accgyro_data[0, 0]  # First column is time
+                # Calculate offset: LSL_time = device_time + offset
+                device_to_lsl_offset = lsl_now - device_time_first
+                if verbose:
+                    print(
+                        f"Initialized time offset: {device_to_lsl_offset:.3f} seconds"
+                    )
+
+            # Prepare chunk data
+            # Extract sensor data (exclude time column): shape (n_samples, 6)
+            accgyro_chunk = accgyro_data[:, 1:].astype(np.float32)
+
+            # Calculate LSL timestamps for all samples
+            device_times = accgyro_data[:, 0]
+            lsl_timestamps = (device_times + device_to_lsl_offset).tolist()
+
+            # Add to ACCGYRO reordering buffer
+            accgyro_buffer.append((lsl_timestamps, accgyro_chunk))
+
+            # Set last_push_time on first data
+            if last_push_time["ACCGYRO"] is None:
+                last_push_time["ACCGYRO"] = lsl_now
+                if not stream_started.is_set():
+                    stream_started.set()
+
+            # Flush buffer if enough time has passed
+            if lsl_now - last_push_time["ACCGYRO"] >= buffer_duration:
+                _flush_buffer("ACCGYRO")
 
     try:
         if verbose:
@@ -213,50 +281,72 @@ async def _stream_async(
         if verbose:
             print("Stopping stream...")
 
-        # Flush any remaining samples in the reordering buffer
-        if len(reorder_buffer) > 0:
+        # Flush any remaining samples in both reordering buffers
+        if len(eeg_buffer) > 0:
             if verbose:
-                print(f"Flushing {len(reorder_buffer)} buffered packets...")
-            _flush_buffer()
+                print(f"Flushing {len(eeg_buffer)} buffered EEG packets...")
+            _flush_buffer("EEG")
 
-        del outlet
+        if len(accgyro_buffer) > 0:
+            if verbose:
+                print(f"Flushing {len(accgyro_buffer)} buffered ACCGYRO packets...")
+            _flush_buffer("ACCGYRO")
+
+        del eeg_outlet
+        del accgyro_outlet
 
         # Write JSON output if requested - save exactly what was sent to LSL
         if lsl_data_log is not None and outfile:
             if verbose:
-                print(
-                    f"Writing {len(lsl_data_log)} LSL push operations to {outfile}..."
-                )
+                total_pushes = len(lsl_data_log["EEG"]) + len(lsl_data_log["ACCGYRO"])
+                print(f"Writing {total_pushes} LSL push operations to {outfile}...")
             try:
-                # Flatten all LSL pushes and sort globally
-                # (Each flush is sorted internally, but flushes may overlap in time)
-                all_samples = []
-                for timestamps, data_chunk in lsl_data_log:
+                # Process EEG data
+                eeg_samples = []
+                for timestamps, data_chunk in lsl_data_log["EEG"]:
                     for i, ts in enumerate(timestamps):
-                        all_samples.append((ts, data_chunk[i, :]))
+                        eeg_samples.append((ts, data_chunk[i, :].tolist()))
 
-                # Sort ALL samples by timestamp to ensure global monotonicity
-                all_samples.sort(key=lambda x: x[0])
+                eeg_samples.sort(key=lambda x: x[0])
+                eeg_timestamps = [s[0] for s in eeg_samples]
+                eeg_data_array = [s[1] for s in eeg_samples]
 
-                # Separate timestamps and data
-                all_timestamps = [s[0] for s in all_samples]
-                all_data_array = np.vstack([s[1] for s in all_samples])
+                # Process ACCGYRO data
+                accgyro_samples = []
+                for timestamps, data_chunk in lsl_data_log["ACCGYRO"]:
+                    for i, ts in enumerate(timestamps):
+                        accgyro_samples.append((ts, data_chunk[i, :].tolist()))
 
-                # Build minimal JSON: timestamps + channel data
-                # This is exactly what LSL received, globally sorted
+                accgyro_samples.sort(key=lambda x: x[0])
+                accgyro_timestamps = [s[0] for s in accgyro_samples]
+                accgyro_data_array = [s[1] for s in accgyro_samples]
+
+                # Build JSON with separate EEG and ACCGYRO data
                 json_data = {
-                    "lsl_timestamps": all_timestamps,
-                    "channels": [
-                        "ACC_X",
-                        "ACC_Y",
-                        "ACC_Z",
-                        "GYRO_X",
-                        "GYRO_Y",
-                        "GYRO_Z",
-                    ],
-                    "data": all_data_array.tolist(),  # Shape: (n_samples, 6)
-                    "n_samples": len(all_timestamps),
-                    "note": "LSL data globally sorted by timestamp",
+                    "EEG": {
+                        "lsl_timestamps": eeg_timestamps,
+                        "channels": ["TP9", "AF7", "AF8", "TP10"],
+                        "data": eeg_data_array,
+                        "n_samples": len(eeg_timestamps),
+                        "sampling_rate": 256.0,
+                        "unit": "microvolts",
+                    },
+                    "ACCGYRO": {
+                        "lsl_timestamps": accgyro_timestamps,
+                        "channels": [
+                            "ACC_X",
+                            "ACC_Y",
+                            "ACC_Z",
+                            "GYRO_X",
+                            "GYRO_Y",
+                            "GYRO_Z",
+                        ],
+                        "data": accgyro_data_array,
+                        "n_samples": len(accgyro_timestamps),
+                        "sampling_rate": 52.0,
+                        "unit": "a.u.",
+                    },
+                    "note": "LSL data globally sorted by timestamp per sensor type",
                 }
 
                 # Ensure output directory exists
@@ -269,14 +359,18 @@ async def _stream_async(
                     json.dump(json_data, f, indent=2)
 
                 if verbose:
-                    print(f"Wrote {len(all_timestamps)} samples to {outfile}")
+                    print(
+                        f"Wrote {len(eeg_timestamps)} EEG samples and {len(accgyro_timestamps)} ACCGYRO samples to {outfile}"
+                    )
                     print("File written successfully.")
             except Exception as exc:
                 if verbose:
                     print(f"Error writing to file: {exc}")
 
         if verbose:
-            print(f"Stream stopped. Total samples sent: {samples_sent}")
+            print(
+                f"Stream stopped. EEG samples: {samples_sent['EEG']}, ACCGYRO samples: {samples_sent['ACCGYRO']}"
+            )
 
 
 def stream(
@@ -287,18 +381,23 @@ def stream(
     verbose: bool = True,
 ) -> None:
     """
-    Stream decoded accelerometer and gyroscope data over LSL.
+    Stream decoded EEG and accelerometer/gyroscope data over LSL.
+
+    Creates two LSL streams:
+    - Muse_EEG: 4 channels (TP9, AF7, AF8, TP10) at 256 Hz
+    - Muse_ACCGYRO: 6 channels (ACC_X/Y/Z, GYRO_X/Y/Z) at 52 Hz
 
     Parameters
     ----------
     address : str
         Device address (e.g., MAC on Windows).
     preset : str
-        Preset to send (e.g., p1035 or p21).
+        Preset to send (e.g., p1041 for all channels, p1035 for basic config).
     duration : float, optional
         Optional stream duration in seconds. Omit to stream until interrupted.
     outfile : str, optional
-        Optional output file to save decoded ACC/GYRO samples. Omit to only stream.
+        Optional output JSON file to save decoded EEG and ACC/GYRO samples.
+        Omit to only stream without saving.
     verbose : bool
         If True, print verbose output.
     """

@@ -67,19 +67,25 @@ data["ACCGYRO"].plot(
 > [!NOTE]  
 > OpenMuse uses [MNE-LSL](https://mne.tools/mne-lsl/), an improved python-binding for the Lab Streaming Layer C++ library, `mne_lsl.lsl`, replacing `pylsl`.
 
-To stream a file over LSL, use:
+To stream data over LSL, use:
 
 ```powershell
 OpenMuse stream --address <your-muse-address>
 ```
 
+This creates **two separate LSL streams**:
+- **Muse_EEG**: 4 EEG channels (TP9, AF7, AF8, TP10) at 256 Hz in microvolts
+- **Muse_ACCGYRO**: 6 motion channels (ACC_X/Y/Z, GYRO_X/Y/Z) at 52 Hz
+
 The following options are available:
 - `--address`: The MAC address of your Muse device (required)
 - `--duration`: Duration of the recording in seconds (if not specified, streaming will continue until you press Ctrl+C in the terminal)
+- `--preset`: Preset configuration (default: `p1041` for all channels)
+- `--outfile`: Optional JSON file to save the streamed data
 
 
 
-To visualize a live LSL stream, open a new terminal (while the streaming is running) and run:
+To visualize live LSL streams, open a new terminal (while the streaming is running) and run:
 
 ```powershell
 OpenMuse view
