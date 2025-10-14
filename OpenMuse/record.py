@@ -1,13 +1,13 @@
 import asyncio
 import os
 import time
-from datetime import datetime, timezone
 from typing import Iterable, Optional
 
 import bleak
 
 from .backends import _run
 from .muse import MuseS
+from .utils import get_utc_timestamp
 
 
 async def _record_async(
@@ -23,9 +23,6 @@ async def _record_async(
 
     notified = 0
     stream_started = asyncio.Event()
-
-    def _ts() -> str:
-        return datetime.now(timezone.utc).isoformat()
 
     # Ensure output directory exists
     try:
@@ -44,7 +41,7 @@ async def _record_async(
             nonlocal notified
             notified += 1
             # Log timestamp, char UUID, and hex payload
-            ts = _ts()
+            ts = get_utc_timestamp()
             line = f"{ts}\t{uuid}\t{data.hex()}\n"
             f.write(line)
             # Raw recording only; no decoding or viewing

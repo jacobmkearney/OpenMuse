@@ -29,10 +29,16 @@ timestamps. Note: Actual device timing may have jitter not captured by this appr
 """
 
 import struct
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
 from datetime import datetime
 import numpy as np
+import pandas as pd
 
+
+# Protocol constants
+PACKET_HEADER_SIZE = 14  # Size of packet header in bytes
+SUBPACKET_HEADER_SIZE = 5  # Size of subpacket header (TAG + 4 bytes)
+DEVICE_CLOCK_HZ = 256000.0  # Device clock frequency: 256 kHz
 
 # Sensor configuration mapping
 # Maps TAG byte to sensor type, channels, samples, sampling rate, and data length
@@ -100,6 +106,66 @@ ACC_SCALE = 0.0000610352
 GYRO_SCALE = -0.0074768
 OPTICS_SCALE = 1.0 / 32768.0
 EEG_SCALE = 1450.0 / 16383.0
+
+# Standard channel label definitions shared across modules
+EEG_CHANNELS = (
+    "EEG_TP9",
+    "EEG_AF7",
+    "EEG_AF8",
+    "EEG_TP10",
+    "AUX_1",
+    "AUX_2",
+    "AUX_3",
+    "AUX_4",
+)
+
+ACCGYRO_CHANNELS = (
+    "ACC_X",
+    "ACC_Y",
+    "ACC_Z",
+    "GYRO_X",
+    "GYRO_Y",
+    "GYRO_Z",
+)
+
+OPTICS_CHANNELS = (
+    "OPTICS_LO_NIR",
+    "OPTICS_RO_NIR",
+    "OPTICS_LO_IR",
+    "OPTICS_RO_IR",
+    "OPTICS_LI_NIR",
+    "OPTICS_RI_NIR",
+    "OPTICS_LI_IR",
+    "OPTICS_RI_IR",
+    "OPTICS_LO_RED",
+    "OPTICS_RO_RED",
+    "OPTICS_LO_AMB",
+    "OPTICS_RO_AMB",
+    "OPTICS_LI_RED",
+    "OPTICS_RI_RED",
+    "OPTICS_LI_AMB",
+    "OPTICS_RI_AMB",
+)
+
+
+def _select_eeg_channels(count: int) -> List[str]:
+    if count <= len(EEG_CHANNELS):
+        return list(EEG_CHANNELS[:count])
+    return [f"EEG_{i+1:02d}" for i in range(count)]
+
+
+_OPTICS_INDEXES = {
+    4: (4, 5, 6, 7),
+    8: tuple(range(8)),
+    16: tuple(range(16)),
+}
+
+
+def _select_optics_channels(count: int) -> List[str]:
+    indices = _OPTICS_INDEXES.get(count)
+    if indices is not None:
+        return [OPTICS_CHANNELS[i] for i in indices]
+    return [f"OPTICS_{i+1:02d}" for i in range(count)]
 
 
 def parse_message(message: str) -> Dict[str, np.ndarray]:
@@ -205,8 +271,8 @@ def _parse_packets(payload: bytes, message_time: datetime, uuid: str) -> List[Di
     offset = 0
 
     while offset < len(payload):
-        # Need at least 14 bytes for packet header
-        if offset + 14 > len(payload):
+        # Need at least PACKET_HEADER_SIZE bytes for packet header
+        if offset + PACKET_HEADER_SIZE > len(payload):
             break
 
         # Read declared packet length
@@ -219,10 +285,12 @@ def _parse_packets(payload: bytes, message_time: datetime, uuid: str) -> List[Di
         # Extract full packet
         pkt_bytes = payload[offset : offset + pkt_len]
 
-        # Parse packet header (14 bytes)
+        # Parse packet header (PACKET_HEADER_SIZE bytes)
         pkt_index = pkt_bytes[1]
         pkt_time_raw = struct.unpack_from("<I", pkt_bytes, 2)[0]
-        pkt_time = pkt_time_raw / 256000.0  # Convert 256 kHz ticks to seconds
+        pkt_time = (
+            pkt_time_raw / DEVICE_CLOCK_HZ
+        )  # Convert device clock ticks to seconds
         pkt_unknown1 = pkt_bytes[6:9]
         pkt_id = pkt_bytes[9]
         pkt_unknown2 = pkt_bytes[10:13]
@@ -237,11 +305,15 @@ def _parse_packets(payload: bytes, message_time: datetime, uuid: str) -> List[Di
             pkt_type is not None
             and byte_13 == 0
             and pkt_len == len(pkt_bytes)
-            and pkt_len >= 14
+            and pkt_len >= PACKET_HEADER_SIZE
         )
 
-        # Extract data section (everything after 14-byte header)
-        pkt_data = pkt_bytes[14:] if len(pkt_bytes) > 14 else b""
+        # Extract data section (everything after header)
+        pkt_data = (
+            pkt_bytes[PACKET_HEADER_SIZE:]
+            if len(pkt_bytes) > PACKET_HEADER_SIZE
+            else b""
+        )
 
         packets.append(
             {
@@ -307,7 +379,7 @@ def _parse_data_subpackets(pkt: Dict) -> List[Dict]:
     # Step 2: Parse all additional subpackets (each with TAG + 4-byte header + data)
     while offset < len(pkt_data):
         # Check if we have enough bytes for TAG + header
-        if offset + 5 > len(pkt_data):
+        if offset + SUBPACKET_HEADER_SIZE > len(pkt_data):
             break
 
         tag_byte = pkt_data[offset]
@@ -320,7 +392,7 @@ def _parse_data_subpackets(pkt: Dict) -> List[Dict]:
 
         # Parse 4-byte subpacket header
         subpkt_index = pkt_data[offset + 1]
-        subpkt_unknown = pkt_data[offset + 2 : offset + 5]
+        subpkt_unknown = pkt_data[offset + 2 : offset + SUBPACKET_HEADER_SIZE]
 
         # Get data length from SENSORS config
         data_len = SENSORS[tag_byte].get("data_len", 0)
@@ -330,11 +402,13 @@ def _parse_data_subpackets(pkt: Dict) -> List[Dict]:
             break
 
         # Check if we have enough bytes for full subpacket
-        if offset + 5 + data_len > len(pkt_data):
+        if offset + SUBPACKET_HEADER_SIZE + data_len > len(pkt_data):
             break
 
         # Extract data bytes
-        data_bytes = pkt_data[offset + 5 : offset + 5 + data_len]
+        data_bytes = pkt_data[
+            offset + SUBPACKET_HEADER_SIZE : offset + SUBPACKET_HEADER_SIZE + data_len
+        ]
 
         subpackets.append(
             {
@@ -347,7 +421,7 @@ def _parse_data_subpackets(pkt: Dict) -> List[Dict]:
         )
 
         # Move to next subpacket
-        offset += 1 + 4 + data_len  # TAG + header + data
+        offset += SUBPACKET_HEADER_SIZE + data_len
 
     return subpackets
 
@@ -374,10 +448,13 @@ def _decode_subpacket_data(subpkt: Dict) -> Optional[Dict]:
     if sensor_type == "Unknown":
         return None
 
-    # Get configuration from TAG
-    config = SENSORS.get(tag_byte, {})
-    n_channels = config.get("n_channels", 0)
-    n_samples = config.get("n_samples", 0)
+    # Get configuration from TAG (cache lookup to avoid redundant dictionary access)
+    config = SENSORS.get(tag_byte)
+    if config is None:
+        return None
+
+    n_channels = config["n_channels"]
+    n_samples = config["n_samples"]
 
     # Decode based on sensor type
     if sensor_type == "ACCGYRO":
@@ -440,6 +517,52 @@ def _decode_battery_data(data_bytes: bytes) -> Optional[np.ndarray]:
     return np.array([battery_percent], dtype=np.float32)
 
 
+def _bytes_to_bits(data_bytes: bytes, n_bytes: int) -> List[int]:
+    """
+    Convert bytes to bit array (LSB first).
+
+    Parameters:
+    -----------
+    data_bytes : bytes
+        Input bytes to convert
+    n_bytes : int
+        Number of bytes to process
+
+    Returns:
+    --------
+    list[int] : List of bits (0 or 1), LSB first
+    """
+    bits = []
+    for byte in data_bytes[:n_bytes]:
+        for bit_pos in range(8):
+            bits.append((byte >> bit_pos) & 1)
+    return bits
+
+
+def _extract_packed_int(bits: List[int], bit_start: int, bit_width: int) -> int:
+    """
+    Extract an integer from a bit array.
+
+    Parameters:
+    -----------
+    bits : list[int]
+        Bit array (0 or 1 values)
+    bit_start : int
+        Starting bit position
+    bit_width : int
+        Number of bits to extract
+
+    Returns:
+    --------
+    int : Extracted integer value
+    """
+    int_value = 0
+    for bit_idx in range(bit_width):
+        if bits[bit_start + bit_idx]:
+            int_value |= 1 << bit_idx
+    return int_value
+
+
 def _decode_eeg_data(data_bytes: bytes, n_channels: int) -> Optional[np.ndarray]:
     """
     Decode EEG data (14-bit packed values).
@@ -456,10 +579,7 @@ def _decode_eeg_data(data_bytes: bytes, n_channels: int) -> Optional[np.ndarray]
     n_samples = 4 if n_channels == 4 else 2
 
     # Convert bytes to bit array (LSB first)
-    bits = []
-    for byte in data_bytes[:28]:
-        for bit_pos in range(8):
-            bits.append((byte >> bit_pos) & 1)
+    bits = _bytes_to_bits(data_bytes, 28)
 
     # Parse 14-bit values
     data = np.zeros((n_samples, n_channels), dtype=np.float32)
@@ -468,13 +588,8 @@ def _decode_eeg_data(data_bytes: bytes, n_channels: int) -> Optional[np.ndarray]
         for channel_idx in range(n_channels):
             bit_start = (sample_idx * n_channels + channel_idx) * 14
 
-            # Extract 14 bits
-            int_value = 0
-            for bit_idx in range(14):
-                if bits[bit_start + bit_idx]:
-                    int_value |= 1 << bit_idx
-
-            # Scale to microvolts
+            # Extract 14 bits and scale to microvolts
+            int_value = _extract_packed_int(bits, bit_start, 14)
             data[sample_idx, channel_idx] = int_value * EEG_SCALE
 
     return data
@@ -525,10 +640,7 @@ def _decode_optics_data(data_bytes: bytes, n_channels: int) -> Optional[np.ndarr
         return None
 
     # Convert bytes to bit array (LSB first)
-    bits = []
-    for byte in data_bytes[:bytes_needed]:
-        for bit_pos in range(8):
-            bits.append((byte >> bit_pos) & 1)
+    bits = _bytes_to_bits(data_bytes, bytes_needed)
 
     # Parse 20-bit values
     data = np.zeros((n_samples, n_channels), dtype=np.float32)
@@ -537,13 +649,8 @@ def _decode_optics_data(data_bytes: bytes, n_channels: int) -> Optional[np.ndarr
         for channel_idx in range(n_channels):
             bit_start = (sample_idx * n_channels + channel_idx) * 20
 
-            # Extract 20 bits
-            int_value = 0
-            for bit_idx in range(20):
-                if bits[bit_start + bit_idx]:
-                    int_value |= 1 << bit_idx
-
-            # Scale
+            # Extract 20 bits and scale
+            int_value = _extract_packed_int(bits, bit_start, 20)
             data[sample_idx, channel_idx] = int_value * OPTICS_SCALE
 
     return data
@@ -596,14 +703,36 @@ def add_timestamps(parsed_data: Dict[str, List[Dict]]) -> Dict[str, np.ndarray]:
             ),
         )
 
-        # Collect all data arrays and assign sequential timestamps
-        all_data = []
-        all_times = []
+        # Efficiently collect all data arrays and assign sequential timestamps
+        if len(sorted_subpackets) == 0:
+            data_array = np.empty((0, 0))
+            times_array = np.empty((0,))
+        else:
+            # Pre-calculate total samples to pre-allocate arrays
+            total_samples = sum(
+                subpkt.get("n_samples", n_samples_per_subpkt)
+                for subpkt in sorted_subpackets
+            )
 
-        # Use the first packet time as base and assign sequential timestamps
-        if len(sorted_subpackets) > 0:
+            # Get number of channels from first subpacket
+            # Handle both 1D and 2D arrays (Battery data is 1D)
+            first_data = sorted_subpackets[0]["data"]
+            if first_data.ndim == 1:
+                n_channels = 1
+                # Ensure 1D arrays are reshaped for consistency
+                for subpkt in sorted_subpackets:
+                    if subpkt["data"].ndim == 1:
+                        subpkt["data"] = subpkt["data"].reshape(-1, 1)
+            else:
+                n_channels = first_data.shape[1]
+
+            # Pre-allocate arrays for efficiency
+            data_array = np.empty((total_samples, n_channels), dtype=np.float32)
+            times_array = np.empty(total_samples, dtype=np.float64)
+
             base_time = sorted_subpackets[0]["pkt_time"]
             sample_counter = 0
+            row_idx = 0
 
             for subpkt in sorted_subpackets:
                 data = subpkt["data"]
@@ -615,17 +744,13 @@ def add_timestamps(parsed_data: Dict[str, List[Dict]]) -> Dict[str, np.ndarray]:
                     base_time + (sample_counter + np.arange(n_samples)) / sampling_rate
                 )
 
-                all_data.append(data)
-                all_times.append(times)
+                # Copy data directly into pre-allocated arrays
+                data_array[row_idx : row_idx + n_samples] = data
+                times_array[row_idx : row_idx + n_samples] = times
 
-                # Increment sample counter
+                # Increment counters
                 sample_counter += n_samples
-
-        # Concatenate all data
-        data_array = np.vstack(all_data) if len(all_data) > 0 else np.empty((0, 0))
-        times_array = (
-            np.concatenate(all_times) if len(all_times) > 0 else np.empty((0,))
-        )
+                row_idx += n_samples
 
         # Add timestamps as first column
         if data_array.size > 0:
@@ -642,7 +767,7 @@ def add_timestamps(parsed_data: Dict[str, List[Dict]]) -> Dict[str, np.ndarray]:
 # ============================================================================
 
 
-def decode_rawdata(messages: List[str]) -> Dict[str, "pd.DataFrame"]:
+def decode_rawdata(messages: List[str]) -> Dict[str, pd.DataFrame]:
     """
     Parse multiple messages and return organized data as Pandas DataFrames.
 
@@ -703,77 +828,12 @@ def decode_rawdata(messages: List[str]) -> Dict[str, "pd.DataFrame"]:
 
         if sensor_type == "EEG":
             n_channels = n_cols - 1
-            if n_channels == 4:
-                # EEG4: TP9, AF7, AF8, TP10
-                columns = ["time", "EEG_TP9", "EEG_AF7", "EEG_AF8", "EEG_TP10"]
-            elif n_channels == 8:
-                # EEG8: TP9, AF7, AF8, TP10 + 4 AUX channels
-                columns = [
-                    "time",
-                    "EEG_TP9",
-                    "EEG_AF7",
-                    "EEG_AF8",
-                    "EEG_TP10",
-                    "AUX_1",
-                    "AUX_2",
-                    "AUX_3",
-                    "AUX_4",
-                ]
-            else:
-                # Fallback for unexpected channel counts
-                columns = ["time"] + [f"EEG_{i+1:02d}" for i in range(n_channels)]
+            columns = ["time", *_select_eeg_channels(n_channels)]
         elif sensor_type == "ACCGYRO":
-            columns = ["time", "ACC_X", "ACC_Y", "ACC_Z", "GYRO_X", "GYRO_Y", "GYRO_Z"]
+            columns = ["time", *ACCGYRO_CHANNELS]
         elif sensor_type == "Optics":
             n_channels = n_cols - 1
-            if n_channels == 4:
-                # Optics4: Left Inner (LI) and Right Inner (RI) sensors
-                # 730nm (NIR) and 850nm (IR)
-                columns = [
-                    "time",
-                    "OPTICS_LI_NIR",
-                    "OPTICS_RI_NIR",
-                    "OPTICS_LI_IR",
-                    "OPTICS_RI_IR",
-                ]
-            elif n_channels == 8:
-                # Optics8: Left Outer (LO), Left Inner (LI), Right Inner (RI), Right Outer (RO)
-                # 730nm (NIR) and 850nm (IR)
-                columns = [
-                    "time",
-                    "OPTICS_LO_NIR",
-                    "OPTICS_RO_NIR",
-                    "OPTICS_LO_IR",
-                    "OPTICS_RO_IR",
-                    "OPTICS_LI_NIR",
-                    "OPTICS_RI_NIR",
-                    "OPTICS_LI_IR",
-                    "OPTICS_RI_IR",
-                ]
-            elif n_channels == 16:
-                # Optics16: All 4 sensors with 730nm (NIR), 850nm (IR), Red, and Ambient
-                columns = [
-                    "time",
-                    "OPTICS_LO_NIR",
-                    "OPTICS_RO_NIR",
-                    "OPTICS_LO_IR",
-                    "OPTICS_RO_IR",
-                    "OPTICS_LI_NIR",
-                    "OPTICS_RI_NIR",
-                    "OPTICS_LI_IR",
-                    "OPTICS_RI_IR",
-                    "OPTICS_LO_RED",
-                    "OPTICS_RO_RED",
-                    "OPTICS_LO_AMB",
-                    "OPTICS_RO_AMB",
-                    "OPTICS_LI_RED",
-                    "OPTICS_RI_RED",
-                    "OPTICS_LI_AMB",
-                    "OPTICS_RI_AMB",
-                ]
-            else:
-                # Fallback for unexpected channel counts
-                columns = ["time"] + [f"OPTICS_{i+1:02d}" for i in range(n_channels)]
+            columns = ["time", *_select_optics_channels(n_channels)]
         elif sensor_type == "Battery":
             columns = ["time", "battery_percent"]
         else:

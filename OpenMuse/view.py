@@ -1,15 +1,22 @@
 """Real-time visualization using GLOO (OpenGL) for maximum performance with many channels."""
 
-import atexit
-import os
-import tempfile
 import time
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 from vispy import app, gloo
 from vispy.util.transforms import ortho
 from vispy.visuals import TextVisual
+
+from .utils import configure_lsl_api_cfg
+
+# Visualization constants
+CHANNEL_DETECTION_DURATION = 2.0  # Seconds to collect data for channel detection
+CHANNEL_STATS_BUFFER_DURATION = (
+    1.5  # Seconds of data for statistics (EEG std, running mean)
+)
+CHANNEL_VARIANCE_THRESHOLD = 1e-10  # Variance threshold to consider channel active
+CHANNEL_MEAN_THRESHOLD = 1e-6  # Mean threshold to consider channel active
 
 # Vertex shader - processes each vertex position
 VERT_SHADER = """
@@ -72,52 +79,6 @@ void main() {
 """
 
 
-def _configure_lsl_api_cfg():
-    """Configure liblsl via a temporary config file to reduce verbosity.
-
-    Disables IPv6 multicast (removes yellow warnings) and lowers log level to -1
-    to silence info/warn messages, without requiring a repo-level config file.
-
-    See https://github.com/hbldh/bleak/discussions/1423
-    """
-    if "LSLAPICFG" in os.environ:
-        return  # Already configured
-
-    cfg_fd, cfg_path = tempfile.mkstemp(prefix="lsl_api_", suffix=".cfg")
-    try:
-        with os.fdopen(cfg_fd, "w") as f:
-            f.write(
-                """
-[ports]
-IPv6 = disable
-
-[log]
-level = -1
-""".lstrip()
-            )
-    except Exception:
-        # If writing fails, close and remove the file and continue without config
-        try:
-            os.close(cfg_fd)
-        except Exception:
-            pass
-        try:
-            os.remove(cfg_path)
-        except Exception:
-            pass
-        return
-
-    os.environ["LSLAPICFG"] = cfg_path
-
-    def _cleanup_cfg():
-        try:
-            os.remove(cfg_path)
-        except Exception:
-            pass
-
-    atexit.register(_cleanup_cfg)
-
-
 class RealtimeViewer:
     """High-performance real-time signal viewer using GLOO."""
 
@@ -135,11 +96,11 @@ class RealtimeViewer:
             ch_names = stream.info.ch_names
             n_channels = len(ch_names)
 
-            # Collect data for 2 seconds to detect active channels
-            time_module.sleep(2.0)
+            # Collect data for CHANNEL_DETECTION_DURATION seconds to detect active channels
+            time_module.sleep(CHANNEL_DETECTION_DURATION)
 
             try:
-                data, timestamps = stream.get_data(winsize=2.0)
+                data, timestamps = stream.get_data(winsize=CHANNEL_DETECTION_DURATION)
             except Exception as e:
                 if verbose:
                     print(f"  Warning: Could not get data from {stream.name}: {e}")
@@ -158,7 +119,10 @@ class RealtimeViewer:
                 ch_data = data[ch_idx, :]
                 variance = np.var(ch_data)
                 # Consider active if variance > threshold or mean != 0
-                is_active = variance > 1e-10 or np.abs(np.mean(ch_data)) > 1e-6
+                is_active = (
+                    variance > CHANNEL_VARIANCE_THRESHOLD
+                    or np.abs(np.mean(ch_data)) > CHANNEL_MEAN_THRESHOLD
+                )
                 channel_active.append(is_active)
 
             self.active_channels.append(channel_active)
@@ -178,11 +142,11 @@ class RealtimeViewer:
 
     def __init__(
         self,
-        streams,
-        window_size=10.0,
-        update_interval=0.005,
-        duration=None,
-        verbose=True,
+        streams: Sequence,
+        window_size: float = 10.0,
+        update_interval: float = 0.005,
+        duration: Optional[float] = None,
+        verbose: bool = True,
     ):
         self.streams = streams
         self.window_size = window_size
@@ -329,12 +293,12 @@ class RealtimeViewer:
                 )
                 self.eeg_std_labels.append((ch_idx, text))
 
-        # Combined buffer for calculating statistics (last 1.5 seconds of data)
+        # Combined buffer for calculating statistics (last CHANNEL_STATS_BUFFER_DURATION seconds of data)
         # Used for both EEG std (impedance) and running mean (centering all channels)
         self.channel_stats_buffer = {}
         for ch_idx, ch_info in enumerate(self.channel_info):
             sfreq = streams[ch_info["stream_idx"]].info["sfreq"]
-            buffer_size = int(sfreq * 1.5)  # 1.5 seconds of data
+            buffer_size = int(sfreq * CHANNEL_STATS_BUFFER_DURATION)
             self.channel_stats_buffer[ch_idx] = np.zeros(buffer_size)
 
         # Create y-axis tick labels for each channel (right-aligned, close to signal edge)
@@ -367,10 +331,10 @@ class RealtimeViewer:
         self._update_y_tick_labels(create_new=True)
 
         # Connect events
-        self.canvas.events.draw.connect(self.on_draw)
-        self.canvas.events.resize.connect(self.on_resize)
-        self.canvas.events.key_press.connect(self.on_key_press)
-        self.canvas.events.mouse_wheel.connect(self.on_mouse_wheel)
+        self.canvas.events.draw.connect(self.on_draw)  # type: ignore[attr-defined]
+        self.canvas.events.resize.connect(self.on_resize)  # type: ignore[attr-defined]
+        self.canvas.events.key_press.connect(self.on_key_press)  # type: ignore[attr-defined]
+        self.canvas.events.mouse_wheel.connect(self.on_mouse_wheel)  # type: ignore[attr-defined]
 
         # Setup timer for updates
         self.timer = app.Timer(self.update_interval, connect=self.on_timer, start=True)
@@ -484,7 +448,7 @@ class RealtimeViewer:
 
     def on_draw(self, event):
         """Render the scene."""
-        gloo.clear(color=(0.1, 0.1, 0.1, 1.0))
+        gloo.clear(color=(0.1, 0.1, 0.1, 1.0))  # type: ignore[arg-type]
 
         # Draw y-limit lines (horizontal lines at min/max of each channel)
         if len(self.y_limit_lines) > 0:
@@ -957,7 +921,7 @@ def view(
     - verbose: Print progress messages
     """
     # Configure LSL to reduce verbosity (disables IPv6 warnings and lowers log level)
-    _configure_lsl_api_cfg()
+    configure_lsl_api_cfg()
 
     from mne_lsl.stream import StreamLSL
 
