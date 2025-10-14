@@ -10,6 +10,16 @@ This software allows recording, streaming via LSL and visualizing signals from t
 > [!WARNING]  
 > OpenMuse is NOT an official product of InteraXon Inc and is not affiliated with or endorsed by the company. It does not come with any warranty and should be considered an experimental software developed for research purposes only.
 
+## Roadmap
+
+- [x] Record raw data to a file
+- [x] Decode raw data into a pandas DataFrame
+- [x] Stream data over LSL
+- [x] Visualize live LSL streams
+- [ ] Validate timestamping accuracy experimentally: confirm we get time-locked ERPs
+- [ ] Validate best PPG signal extraction method
+- [ ] Validate fNIRS signal extraction method
+
 ## Installation
 
 Install from GitHub by opening a terminal and running:
