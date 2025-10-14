@@ -1,5 +1,8 @@
 """Real-time visualization using GLOO (OpenGL) for maximum performance with many channels."""
 
+import atexit
+import os
+import tempfile
 import time
 from typing import Optional
 
@@ -67,6 +70,52 @@ void main() {
     gl_FragColor = v_color;
 }
 """
+
+
+def _configure_lsl_api_cfg():
+    """Configure liblsl via a temporary config file to reduce verbosity.
+
+    Disables IPv6 multicast (removes yellow warnings) and lowers log level to -1
+    to silence info/warn messages, without requiring a repo-level config file.
+
+    See https://github.com/hbldh/bleak/discussions/1423
+    """
+    if "LSLAPICFG" in os.environ:
+        return  # Already configured
+
+    cfg_fd, cfg_path = tempfile.mkstemp(prefix="lsl_api_", suffix=".cfg")
+    try:
+        with os.fdopen(cfg_fd, "w") as f:
+            f.write(
+                """
+[ports]
+IPv6 = disable
+
+[log]
+level = -1
+""".lstrip()
+            )
+    except Exception:
+        # If writing fails, close and remove the file and continue without config
+        try:
+            os.close(cfg_fd)
+        except Exception:
+            pass
+        try:
+            os.remove(cfg_path)
+        except Exception:
+            pass
+        return
+
+    os.environ["LSLAPICFG"] = cfg_path
+
+    def _cleanup_cfg():
+        try:
+            os.remove(cfg_path)
+        except Exception:
+            pass
+
+    atexit.register(_cleanup_cfg)
 
 
 class RealtimeViewer:
@@ -907,6 +956,9 @@ def view(
     - update_interval: Update interval in seconds (default: 0.005 = 200 Hz)
     - verbose: Print progress messages
     """
+    # Configure LSL to reduce verbosity (disables IPv6 warnings and lowers log level)
+    _configure_lsl_api_cfg()
+
     from mne_lsl.stream import StreamLSL
 
     # If no stream specified, try to connect to all available Muse streams
