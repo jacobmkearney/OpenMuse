@@ -16,9 +16,10 @@ VERT_SHADER = """
 attribute float a_position;      // Y value of the data point
 attribute vec3 a_index;           // (channel_index, sample_index, unused)
 attribute vec3 a_color;           // RGB color for this channel
+attribute float a_y_scale;        // Per-channel amplitude scale
 
 // Uniforms (constants for all vertices)
-uniform vec2 u_scale;             // (x_scale, y_scale) for zooming
+uniform vec2 u_scale;             // (x_scale, unused) for x-axis zooming
 uniform vec2 u_size;              // (n_channels, 1)
 uniform float u_n_samples;        // Number of samples per channel
 uniform mat4 u_projection;        // Projection matrix
@@ -31,20 +32,24 @@ void main() {
     float channel_idx = a_index.x;
     float sample_idx = a_index.y;
     
-    // X position: Leave space on left for channel names (start at 0.08 instead of 0)
-    float x_margin = 0.08;  // 8% of width reserved for labels
+    // X position: Leave space on left for channel names and ticks
+    float x_margin = 0.15;  // 15% of width reserved for labels and ticks
     float x = x_margin + (1.0 - x_margin) * (sample_idx / u_n_samples);
     
-    // Y position: stack channels vertically
-    // Each channel gets 1/n_channels of vertical space
-    float y_offset = channel_idx / u_size.x;
-    float y_scale = 1.0 / u_size.x;  // Height allocated to each channel
+    // Y position: stack channels vertically with bottom margin for x-axis labels
+    float y_bottom_margin = 0.03;  // 3% bottom margin for x-axis time labels
+    float y_usable_height = 1.0 - y_bottom_margin;
+    
+    // Each channel gets 1/n_channels of usable vertical space
+    float y_offset = y_bottom_margin + (channel_idx / u_size.x) * y_usable_height;
+    float y_scale = y_usable_height / u_size.x;  // Height allocated to each channel
     
     // Center the signal within its allocated space
     // a_position is normalized to [-1, 1], scale by 0.35 to use more space
-    float y = y_offset + y_scale * 0.5 + (a_position * y_scale * 0.35);
+    // a_y_scale controls per-channel amplitude scaling (mouse wheel zoom)
+    float y = y_offset + y_scale * 0.5 + (a_position * y_scale * 0.35 * a_y_scale);
     
-    // Apply projection
+    // Apply projection (only apply x scale to x coordinate)
     gl_Position = u_projection * vec4(x * u_scale.x, y, 0.0, 1.0);
     
     // Pass color to fragment shader
@@ -67,6 +72,65 @@ void main() {
 class RealtimeViewer:
     """High-performance real-time signal viewer using GLOO."""
 
+    def _detect_active_channels(self, streams, verbose):
+        """Detect which channels have actual data (non-zero variance)."""
+        import time as time_module
+
+        if verbose:
+            print("Detecting active channels (collecting 2 seconds of data)...")
+
+        self.active_channels = []
+
+        for stream in streams:
+            # Get number of channels from channel names list
+            ch_names = stream.info.ch_names
+            n_channels = len(ch_names)
+
+            # Collect data for 2 seconds to detect active channels
+            time_module.sleep(2.0)
+
+            try:
+                data, timestamps = stream.get_data(winsize=2.0)
+            except Exception as e:
+                if verbose:
+                    print(f"  Warning: Could not get data from {stream.name}: {e}")
+                # Mark all channels as active if we can't detect
+                self.active_channels.append([True] * n_channels)
+                continue
+
+            if data.shape[1] == 0:
+                # No data yet, mark all as active
+                self.active_channels.append([True] * n_channels)
+                continue
+
+            # Check variance for each channel
+            channel_active = []
+            for ch_idx in range(n_channels):
+                ch_data = data[ch_idx, :]
+                variance = np.var(ch_data)
+                # Consider active if variance > threshold or mean != 0
+                is_active = variance > 1e-10 or np.abs(np.mean(ch_data)) > 1e-6
+                channel_active.append(is_active)
+
+            self.active_channels.append(channel_active)
+
+            # Report findings
+            if verbose:
+                active_names = [
+                    ch_names[i] for i, active in enumerate(channel_active) if active
+                ]
+                inactive_names = [
+                    ch_names[i] for i, active in enumerate(channel_active) if not active
+                ]
+                print(
+                    f"  {stream.name}: {len(active_names)}/{n_channels} active channels"
+                )
+                if inactive_names:
+                    print(f"    Hidden (zero-padded): {', '.join(inactive_names)}")
+
+        if verbose:
+            print()
+
     def __init__(
         self,
         streams,
@@ -83,6 +147,9 @@ class RealtimeViewer:
         self.start_time = time.time()
 
         # Collect channel info from all streams
+        # First, detect active channels (non-zero variance)
+        self._detect_active_channels(streams, verbose)
+
         self.channel_info = []  # List of (stream_idx, ch_idx, ch_name, color, y_range)
         self.total_channels = 0
 
@@ -108,6 +175,9 @@ class RealtimeViewer:
             is_optics = "OPTICS" in stream_name.upper()
 
             for ch_idx, ch_name in enumerate(stream.info.ch_names):
+                # Skip inactive channels (zero-padded)
+                if not self.active_channels[stream_idx][ch_idx]:
+                    continue
                 # Determine color and y-range (for proper scaling)
                 if is_eeg:
                     color = eeg_colors[ch_idx % len(eeg_colors)]
@@ -117,8 +187,8 @@ class RealtimeViewer:
                 elif is_optics:
                     color = optics_colors[ch_idx % len(optics_colors)]
                     y_range = 1.0  # Normalized
-                    y_min, y_max = -1.0, 1.0
-                    y_ticks = [-1, 0, 1]
+                    y_min, y_max = 0.0, 2.0
+                    y_ticks = [0, 1, 2]
                 elif "ACC" in ch_name.upper():
                     color = acc_color
                     y_range = 1.0  # ±1g
@@ -140,6 +210,7 @@ class RealtimeViewer:
                         "y_min": y_min,
                         "y_max": y_max,
                         "y_ticks": y_ticks,
+                        "y_scale": 1.0,  # Individual channel group scale
                     }
                 )
                 self.total_channels += 1
@@ -181,7 +252,7 @@ class RealtimeViewer:
         self.program["u_n_samples"] = float(self.n_samples)
         self.program["u_projection"] = ortho(0, 1, 0, 1, -1, 1)
 
-        # Create text labels for channel names (y-axis, left side)
+        # Create text labels for channel names (y-axis, left side, right-aligned)
         self.channel_labels = []
         for ch_idx, ch_info in enumerate(self.channel_info):
             text = TextVisual(
@@ -189,7 +260,7 @@ class RealtimeViewer:
                 pos=(10, 0),  # Will be positioned in on_draw
                 color="white",
                 font_size=10,
-                anchor_x="left",
+                anchor_x="right",  # Right-aligned at left edge
                 anchor_y="center",
                 bold=True,
             )
@@ -226,24 +297,13 @@ class RealtimeViewer:
                 buffer_size = int(sfreq * 1.0)  # 1 second of data
                 self.eeg_std_buffer[ch_idx] = np.zeros(buffer_size)
 
-        # Create y-axis tick labels for each channel
+        # Create y-axis tick labels for each channel (right-aligned, close to signal edge)
+        # Store base tick values and create/update text labels dynamically
         self.y_tick_labels = []
         for ch_idx, ch_info in enumerate(self.channel_info):
-            tick_texts = []
-            for tick_val in ch_info["y_ticks"]:
-                text = TextVisual(
-                    str(int(tick_val)),
-                    pos=(0, 0),  # Will be positioned in on_draw
-                    color="gray",
-                    font_size=7,
-                    anchor_x="right",
-                    anchor_y="center",
-                )
-                text.transforms.configure(
-                    canvas=self.canvas, viewport=(0, 0, *self.canvas.size)
-                )
-                tick_texts.append((tick_val, text))
-            self.y_tick_labels.append(tick_texts)
+            self.y_tick_labels.append(
+                []
+            )  # Will be populated in _update_y_tick_labels()
 
         # Create text labels for time axis (x-axis)
         self.time_labels = []
@@ -262,6 +322,9 @@ class RealtimeViewer:
                 canvas=self.canvas, viewport=(0, 0, *self.canvas.size)
             )
             self.time_labels.append((time_val, text))
+
+        # Initialize y-tick labels
+        self._update_y_tick_labels()
 
         # Connect events
         self.canvas.events.draw.connect(self.on_draw)
@@ -303,9 +366,16 @@ class RealtimeViewer:
         colors = np.array([ch["color"] for ch in self.channel_info], dtype=np.float32)
         a_color = np.repeat(colors, self.n_samples, axis=0)
 
+        # Create y_scale array (each channel's scale, repeated for all samples)
+        y_scales = np.array(
+            [ch["y_scale"] for ch in self.channel_info], dtype=np.float32
+        )
+        a_y_scale = np.repeat(y_scales, self.n_samples)
+
         # Set attributes
         self.program["a_index"] = a_index
         self.program["a_color"] = a_color
+        self.program["a_y_scale"] = a_y_scale
         # a_position will be updated each frame with actual data
         self.program["a_position"] = self.data.T.ravel().astype(np.float32)
 
@@ -341,25 +411,33 @@ class RealtimeViewer:
         # Create horizontal grid lines at y-limits for each channel
         # These correspond to where the min/max ticks are shown
         # Signal uses 35% (0.35) of channel height on each side of center
+        # Account for bottom margin (3% reserved for x-axis labels)
+        y_bottom_margin = 0.03
+        y_usable_height = 1.0 - y_bottom_margin
+
         y_limit_lines = []
         for ch_idx in range(self.total_channels):
-            y_offset = ch_idx / self.total_channels
-            channel_height = 1.0 / self.total_channels
+            y_offset = (
+                y_bottom_margin + (ch_idx / self.total_channels) * y_usable_height
+            )
+            channel_height = y_usable_height / self.total_channels
             y_center = y_offset + 0.5 * channel_height
 
             # Lines at ±35% from center (matching the 0.35 scale in shader)
             y_top = y_center + 0.35 * channel_height  # Upper y-limit
             y_bottom = y_center - 0.35 * channel_height  # Lower y-limit
 
-            y_limit_lines.extend([[0.08, y_top], [1.0, y_top]])
-            y_limit_lines.extend([[0.08, y_bottom], [1.0, y_bottom]])
+            y_limit_lines.extend([[0.15, y_top], [1.0, y_top]])
+            y_limit_lines.extend([[0.15, y_bottom], [1.0, y_bottom]])
 
         # Add zero lines for each channel (drawn separately with thicker line)
         self.zero_lines = []
         for ch_idx in range(self.total_channels):
-            y_offset = ch_idx / self.total_channels
-            y_center = y_offset + 0.5 / self.total_channels
-            self.zero_lines.extend([[0.08, y_center], [1.0, y_center]])
+            y_offset = (
+                y_bottom_margin + (ch_idx / self.total_channels) * y_usable_height
+            )
+            y_center = y_offset + 0.5 * (y_usable_height / self.total_channels)
+            self.zero_lines.extend([[0.15, y_center], [1.0, y_center]])
 
         self.y_limit_lines = np.array(y_limit_lines, dtype=np.float32)
         self.zero_lines = np.array(self.zero_lines, dtype=np.float32)
@@ -390,22 +468,31 @@ class RealtimeViewer:
 
         # Draw channel labels and y-ticks
         width, height = self.canvas.size
+        # Account for bottom margin (3% reserved for x-axis labels)
+        y_bottom_margin = 0.03
+        y_usable_height = 1.0 - y_bottom_margin
+
         for ch_idx, (text_visual, ch_info) in enumerate(
             zip(self.channel_labels, self.channel_info)
         ):
-            # Calculate channel's vertical bounds
-            y_offset = ch_idx / self.total_channels
-            channel_height = height / self.total_channels
+            # Calculate channel's vertical bounds with bottom margin
+            y_offset = (
+                y_bottom_margin + (ch_idx / self.total_channels) * y_usable_height
+            )
+            channel_height = (y_usable_height / self.total_channels) * height
             y_bottom = height - (y_offset * height)
             y_top = y_bottom - channel_height
             y_center = (y_bottom + y_top) / 2
 
-            # Draw channel name on the left (moved right to make room for ticks)
-            text_visual.pos = (75, y_center)
+            # Draw channel name at the left edge (right-aligned)
+            # Increased space to accommodate longer names like "OPTICS_LO_NIR"
+            text_visual.pos = (120, y_center)
             text_visual.draw()
 
-            # Draw y-tick labels for this channel
+            # Draw y-tick labels for this channel (right-aligned, close to signal edge)
             # Position ticks to align with grid lines (at ±35% from center)
+            # Place at width * 0.15 - 5 pixels (just before signal starts)
+            tick_x = width * 0.15 - 5
             y_range = ch_info["y_max"] - ch_info["y_min"]
             for idx, (tick_val, tick_text) in enumerate(self.y_tick_labels[ch_idx]):
                 # Normalize tick value to [-1, 1] (same as shader normalization)
@@ -420,7 +507,7 @@ class RealtimeViewer:
                     tick_y_normalized * channel_height
                 )  # Convert to pixels
 
-                tick_text.pos = (40, tick_y)
+                tick_text.pos = (tick_x, tick_y)
                 tick_text.draw()
 
             # Draw EEG standard deviation (impedance indicator) on the right side
@@ -431,7 +518,7 @@ class RealtimeViewer:
                     break
 
         # Draw time labels (x-axis)
-        x_margin = 0.08  # Same as in shader
+        x_margin = 0.15  # Same as in shader (15% for labels and ticks)
         signal_width = width * (1.0 - x_margin)
         x_start = width * x_margin
 
@@ -440,7 +527,8 @@ class RealtimeViewer:
             # Map to signal area only (after the left margin)
             x_fraction = (time_val + self.window_size) / self.window_size
             x_pos = x_start + (x_fraction * signal_width)
-            text_visual.pos = (x_pos, height - 10)
+            # Increased bottom margin to 25px to prevent overlap with bottom channel
+            text_visual.pos = (x_pos, height - 25)
             text_visual.draw()
 
     def on_resize(self, event):
@@ -460,23 +548,173 @@ class RealtimeViewer:
         for _, text in self.time_labels:
             text.transforms.configure(canvas=self.canvas, viewport=(0, 0, *event.size))
 
+    def _update_time_labels(self):
+        """Update time labels based on current window_size."""
+        # Remove old labels
+        self.time_labels = []
+
+        # Create new labels
+        n_time_ticks = int(self.window_size) + 1  # One per second
+        for i in range(n_time_ticks):
+            time_val = -self.window_size + i  # From -window_size to 0
+            text = TextVisual(
+                f"{time_val:.0f}s",
+                pos=(0, 0),  # Will be positioned in on_draw
+                color="white",
+                font_size=9,
+                anchor_x="center",
+                anchor_y="top",
+            )
+            text.transforms.configure(
+                canvas=self.canvas, viewport=(0, 0, *self.canvas.size)
+            )
+            self.time_labels.append((time_val, text))
+
+    def _update_y_tick_labels(self):
+        """Regenerate y-axis tick labels based on current channel scales."""
+        self.y_tick_labels = []
+        for ch_idx, ch_info in enumerate(self.channel_info):
+            tick_texts = []
+            y_scale = ch_info["y_scale"]
+            base_ticks = ch_info["y_ticks"]
+
+            # Scale tick values based on current zoom
+            for base_tick in base_ticks:
+                # Scale the tick value inversely (zoom in means smaller range shown)
+                scaled_tick = base_tick / y_scale
+
+                # Format based on magnitude
+                if abs(scaled_tick) >= 10:
+                    tick_str = str(int(scaled_tick))
+                elif abs(scaled_tick) >= 1:
+                    tick_str = f"{scaled_tick:.1f}"
+                else:
+                    tick_str = f"{scaled_tick:.2f}"
+
+                text = TextVisual(
+                    tick_str,
+                    pos=(0, 0),  # Will be positioned in on_draw
+                    color="gray",
+                    font_size=7,
+                    anchor_x="right",
+                    anchor_y="center",
+                )
+                text.transforms.configure(
+                    canvas=self.canvas, viewport=(0, 0, *self.canvas.size)
+                )
+                tick_texts.append((base_tick, text))  # Store base value for positioning
+            self.y_tick_labels.append(tick_texts)
+
+    def _get_channel_at_y(self, y_pixel):
+        """Get the channel index at a given y pixel coordinate."""
+        if self.total_channels == 0:
+            return None
+
+        height = self.canvas.size[1]
+        # Account for 3% bottom margin
+        bottom_margin = height * 0.03
+        usable_height = height - bottom_margin
+
+        # Each channel gets equal vertical space
+        channel_height = usable_height / self.total_channels
+
+        # Flip y coordinate (canvas is bottom-up, but mouse is top-down)
+        y_from_bottom = height - y_pixel
+
+        # Check if in valid range
+        if y_from_bottom < bottom_margin or y_from_bottom >= height:
+            return None
+
+        # Calculate channel index
+        ch_idx = int((y_from_bottom - bottom_margin) / channel_height)
+        if 0 <= ch_idx < self.total_channels:
+            return ch_idx
+        return None
+
     def on_key_press(self, event):
-        """Handle keyboard input for zooming."""
+        """Handle keyboard input for time window zooming."""
         if event.key.name in ["+", "-", "="]:
-            # Time axis zoom
-            dx = -0.1 if event.key.name in ["+", "="] else 0.1
-            scale_x, scale_y = self.program["u_scale"]
-            new_scale_x = max(0.5, min(5.0, scale_x * np.exp(dx)))
-            self.program["u_scale"] = (new_scale_x, scale_y)
+            # Time window zoom - change window_size (not u_scale which shifts signals)
+            if event.key.name in ["+", "="]:
+                # Zoom in - show less time (smaller window)
+                self.window_size = max(1.0, self.window_size * 0.8)
+            else:
+                # Zoom out - show more time (larger window)
+                self.window_size = min(30.0, self.window_size * 1.25)
+
+            # Regenerate time labels with new window size
+            self._update_time_labels()
             self.canvas.update()
 
     def on_mouse_wheel(self, event):
-        """Handle mouse wheel for amplitude zoom."""
-        dy = np.sign(event.delta[1]) * 0.1
-        scale_x, scale_y = self.program["u_scale"]
-        new_scale_y = max(0.5, min(5.0, scale_y * np.exp(dy)))
-        self.program["u_scale"] = (scale_x, new_scale_y)
-        self.canvas.update()
+        """Handle mouse wheel for amplitude zoom (per channel group under mouse)."""
+        # event.delta can be a tuple or have different structures depending on platform
+        try:
+            if hasattr(event.delta, "__getitem__"):
+                delta = event.delta[1] if len(event.delta) > 1 else event.delta[0]
+            else:
+                delta = event.delta
+        except (TypeError, IndexError):
+            delta = 0
+
+        if delta != 0:
+            # Get channel under mouse cursor
+            mouse_y = event.pos[1] if hasattr(event, "pos") else None
+            target_ch = self._get_channel_at_y(mouse_y) if mouse_y is not None else None
+
+            if target_ch is not None:
+                # Find the channel group (channels from same stream with similar type)
+                target_info = self.channel_info[target_ch]
+                target_name = target_info["name"]
+
+                # Determine group type
+                if "EEG" in target_name.upper():
+                    group_type = "EEG"
+                elif "OPTICS" in target_name.upper():
+                    group_type = "OPTICS"
+                elif "ACC" in target_name.upper():
+                    group_type = "ACC"
+                elif "GYRO" in target_name.upper():
+                    group_type = "GYRO"
+                else:
+                    group_type = None
+
+                # Scale all channels in the same group
+                dy = np.sign(delta) * 0.1
+                for ch_info in self.channel_info:
+                    ch_name = ch_info["name"]
+                    is_same_group = False
+
+                    if group_type == "EEG" and "EEG" in ch_name.upper():
+                        is_same_group = True
+                    elif group_type == "OPTICS" and "OPTICS" in ch_name.upper():
+                        is_same_group = True
+                    elif group_type == "ACC" and "ACC" in ch_name.upper():
+                        is_same_group = True
+                    elif group_type == "GYRO" and "GYRO" in ch_name.upper():
+                        is_same_group = True
+
+                    if is_same_group:
+                        # Update this channel's scale
+                        current_scale = ch_info["y_scale"]
+                        new_scale = max(0.5, min(5.0, current_scale * np.exp(dy)))
+                        ch_info["y_scale"] = new_scale
+
+                # Regenerate y-tick labels with new scales
+                self._update_y_tick_labels()
+
+                # Update shader attribute with new scales
+                self._update_shader_scales()
+
+                self.canvas.update()
+
+    def _update_shader_scales(self):
+        """Update the a_y_scale shader attribute with current channel scales."""
+        y_scales = np.array(
+            [ch["y_scale"] for ch in self.channel_info], dtype=np.float32
+        )
+        a_y_scale = np.repeat(y_scales, self.n_samples)
+        self.program["a_y_scale"] = a_y_scale
 
     def on_timer(self, event):
         """Update data from streams."""
