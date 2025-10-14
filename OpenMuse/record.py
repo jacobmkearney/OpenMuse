@@ -67,18 +67,8 @@ async def _record_async(
             # Use shared connection routine
             await MuseS.connect_and_initialize(client, preset, data_callbacks, verbose)
 
-            # Wait briefly for streaming to start before declaring success
-            if verbose:
-                print("Waiting for streaming to start (up to 3.0s)...")
-            try:
-                await asyncio.wait_for(stream_started.wait(), timeout=3.0)
-                if verbose:
-                    print("Streaming started.")
-            except asyncio.TimeoutError:
-                if verbose:
-                    print(
-                        "Warning: no data received within 3.0s; will continue up to timeout."
-                    )
+            # Streaming is now active (callbacks are registered and device is configured)
+            # Data will start flowing asynchronously
 
             if verbose:
                 print(f"Recording for {duration} seconds to {outfile} ...")

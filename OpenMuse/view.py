@@ -119,14 +119,10 @@ class RealtimeViewer:
                 active_names = [
                     ch_names[i] for i, active in enumerate(channel_active) if active
                 ]
-                inactive_names = [
-                    ch_names[i] for i, active in enumerate(channel_active) if not active
-                ]
+                n_active = len(active_names)
                 print(
-                    f"  {stream.name}: {len(active_names)}/{n_channels} active channels"
+                    f"  {stream.name}: {n_active} active channel{'s' if n_active != 1 else ''}"
                 )
-                if inactive_names:
-                    print(f"    Hidden (zero-padded): {', '.join(inactive_names)}")
 
         if verbose:
             print()
@@ -178,27 +174,24 @@ class RealtimeViewer:
                 # Skip inactive channels (zero-padded)
                 if not self.active_channels[stream_idx][ch_idx]:
                     continue
-                # Determine color and y-range (for proper scaling)
+                # Determine color and display range (for proper scaling)
+                # Range is the total vertical span; signals will be centered around their mean
                 if is_eeg:
                     color = eeg_colors[ch_idx % len(eeg_colors)]
-                    y_range = 1000.0  # 0 to 1000 raw EEG units
-                    y_min, y_max = 0.0, 1000.0
-                    y_ticks = [0, 500, 1000]
+                    y_range = 1000.0  # Default range: max - min of original limits
+                    y_ticks = [-500, 0, 500]  # Relative to center
                 elif is_optics:
                     color = optics_colors[ch_idx % len(optics_colors)]
-                    y_range = 1.0  # Normalized
-                    y_min, y_max = 0.0, 2.0
-                    y_ticks = [0, 1, 2]
+                    y_range = 0.4
+                    y_ticks = [-0.5, 0, 0.5]  # Relative to center
                 elif "ACC" in ch_name.upper():
                     color = acc_color
-                    y_range = 1.0  # ±1g
-                    y_min, y_max = -1.0, 1.0
-                    y_ticks = [-1, 0, 1]
+                    y_range = 2.0  # 1 - (-1) = 2.0
+                    y_ticks = [-1, 0, 1]  # Relative to center
                 else:  # GYRO
                     color = gyro_color
-                    y_range = 245.0  # ±245 deg/s
-                    y_min, y_max = -245.0, 245.0
-                    y_ticks = [-245, 0, 245]
+                    y_range = 490.0  # 245 - (-245) = 490
+                    y_ticks = [-245, 0, 245]  # Relative to center
 
                 self.channel_info.append(
                     {
@@ -206,11 +199,10 @@ class RealtimeViewer:
                         "ch_idx": ch_idx,
                         "name": ch_name,
                         "color": color,
-                        "y_range": y_range,
-                        "y_min": y_min,
-                        "y_max": y_max,
-                        "y_ticks": y_ticks,
+                        "y_range": y_range,  # Total vertical span
+                        "y_ticks": y_ticks,  # Tick values relative to center
                         "y_scale": 1.0,  # Individual channel group scale
+                        "y_mean": 0.0,  # Running mean (updated each frame)
                     }
                 )
                 self.total_channels += 1
@@ -288,14 +280,13 @@ class RealtimeViewer:
                 )
                 self.eeg_std_labels.append((ch_idx, text))
 
-        # Buffer for calculating EEG std (last 1 second of data)
-        self.eeg_std_buffer = {}
+        # Combined buffer for calculating statistics (last 1.5 seconds of data)
+        # Used for both EEG std (impedance) and running mean (centering all channels)
+        self.channel_stats_buffer = {}
         for ch_idx, ch_info in enumerate(self.channel_info):
-            stream_name = streams[ch_info["stream_idx"]].name
-            if "EEG" in stream_name.upper():
-                sfreq = streams[ch_info["stream_idx"]].info["sfreq"]
-                buffer_size = int(sfreq * 1.0)  # 1 second of data
-                self.eeg_std_buffer[ch_idx] = np.zeros(buffer_size)
+            sfreq = streams[ch_info["stream_idx"]].info["sfreq"]
+            buffer_size = int(sfreq * 1.5)  # 1.5 seconds of data
+            self.channel_stats_buffer[ch_idx] = np.zeros(buffer_size)
 
         # Create y-axis tick labels for each channel (right-aligned, close to signal edge)
         # Store base tick values and create/update text labels dynamically
@@ -324,7 +315,7 @@ class RealtimeViewer:
             self.time_labels.append((time_val, text))
 
         # Initialize y-tick labels
-        self._update_y_tick_labels()
+        self._update_y_tick_labels(create_new=True)
 
         # Connect events
         self.canvas.events.draw.connect(self.on_draw)
@@ -490,22 +481,24 @@ class RealtimeViewer:
             text_visual.draw()
 
             # Draw y-tick labels for this channel (right-aligned, close to signal edge)
-            # Position ticks to align with grid lines (at ±35% from center)
+            # Position ticks to match shader positioning
             # Place at width * 0.15 - 5 pixels (just before signal starts)
             tick_x = width * 0.15 - 5
-            y_range = ch_info["y_max"] - ch_info["y_min"]
-            for idx, (tick_val, tick_text) in enumerate(self.y_tick_labels[ch_idx]):
-                # Normalize tick value to [-1, 1] (same as shader normalization)
-                normalized_signal = 2.0 * (tick_val - ch_info["y_min"]) / y_range - 1.0
+            y_range = ch_info["y_range"]
+            y_scale_zoom = ch_info["y_scale"]  # User's zoom level (from mouse wheel)
 
-                # Apply the same 0.35 scale and positioning as in shader
-                # This ensures ticks align exactly with grid lines
-                tick_y_normalized = (
-                    normalized_signal * 0.35
-                )  # Scale by 0.35 like in shader
-                tick_y = y_center - (
-                    tick_y_normalized * channel_height
-                )  # Convert to pixels
+            for idx, (tick_val, tick_text) in enumerate(self.y_tick_labels[ch_idx]):
+                # tick_val is relative to center (e.g., -500, 0, 500 for EEG)
+                # Normalize: data is normalized as 2.0 * (value - mean) / y_range
+                # For tick_val relative to center: normalized = 2.0 * tick_val / y_range
+                normalized_tick = 2.0 * tick_val / y_range
+
+                # Shader applies: y_center + (normalized * channel_height * 0.35 * y_scale_zoom)
+                # So tick position in pixels:
+                tick_y_offset = normalized_tick * channel_height * 0.35 * y_scale_zoom
+                tick_y = (
+                    y_center - tick_y_offset
+                )  # Subtract because screen y is flipped
 
                 tick_text.pos = (tick_x, tick_y)
                 tick_text.draw()
@@ -570,40 +563,74 @@ class RealtimeViewer:
             )
             self.time_labels.append((time_val, text))
 
-    def _update_y_tick_labels(self):
-        """Regenerate y-axis tick labels based on current channel scales."""
-        self.y_tick_labels = []
-        for ch_idx, ch_info in enumerate(self.channel_info):
-            tick_texts = []
-            y_scale = ch_info["y_scale"]
-            base_ticks = ch_info["y_ticks"]
+    def _update_y_tick_labels(self, create_new=False):
+        """Update y-axis tick labels based on current channel scales.
 
-            # Scale tick values based on current zoom
-            for base_tick in base_ticks:
-                # Scale the tick value inversely (zoom in means smaller range shown)
-                scaled_tick = base_tick / y_scale
+        Args:
+            create_new: If True, create new TextVisual objects. If False, just update text.
+        """
+        if create_new or not self.y_tick_labels:
+            # Create new TextVisual objects (first time or forced)
+            self.y_tick_labels = []
+            for ch_idx, ch_info in enumerate(self.channel_info):
+                tick_texts = []
+                y_scale = ch_info["y_scale"]
+                y_mean = ch_info["y_mean"]
+                base_ticks = ch_info["y_ticks"]
 
-                # Format based on magnitude
-                if abs(scaled_tick) >= 10:
-                    tick_str = str(int(scaled_tick))
-                elif abs(scaled_tick) >= 1:
-                    tick_str = f"{scaled_tick:.1f}"
-                else:
-                    tick_str = f"{scaled_tick:.2f}"
+                # Scale tick values based on current zoom and center around mean
+                for base_tick in base_ticks:
+                    # Tick shows value relative to current mean, scaled by zoom
+                    actual_tick = y_mean + (base_tick / y_scale)
 
-                text = TextVisual(
-                    tick_str,
-                    pos=(0, 0),  # Will be positioned in on_draw
-                    color="gray",
-                    font_size=7,
-                    anchor_x="right",
-                    anchor_y="center",
-                )
-                text.transforms.configure(
-                    canvas=self.canvas, viewport=(0, 0, *self.canvas.size)
-                )
-                tick_texts.append((base_tick, text))  # Store base value for positioning
-            self.y_tick_labels.append(tick_texts)
+                    # Format based on magnitude
+                    if abs(actual_tick) >= 10:
+                        tick_str = str(int(actual_tick))
+                    elif abs(actual_tick) >= 1:
+                        tick_str = f"{actual_tick:.1f}"
+                    else:
+                        tick_str = f"{actual_tick:.2f}"
+
+                    text = TextVisual(
+                        tick_str,
+                        pos=(0, 0),  # Will be positioned in on_draw
+                        color="gray",
+                        font_size=7,
+                        anchor_x="right",
+                        anchor_y="center",
+                    )
+                    text.transforms.configure(
+                        canvas=self.canvas, viewport=(0, 0, *self.canvas.size)
+                    )
+                    tick_texts.append(
+                        (base_tick, text)
+                    )  # Store base value for positioning
+                self.y_tick_labels.append(tick_texts)
+        else:
+            # Just update the text content (much faster!)
+            for ch_idx, ch_info in enumerate(self.channel_info):
+                y_scale = ch_info["y_scale"]
+                y_mean = ch_info["y_mean"]
+                base_ticks = ch_info["y_ticks"]
+
+                for tick_idx, (base_tick, text) in enumerate(
+                    self.y_tick_labels[ch_idx]
+                ):
+                    # Tick shows value relative to current mean, scaled by zoom
+                    # base_tick is relative to center (e.g., -1, 0, 1 for ACC)
+                    # Add mean and scale by zoom
+                    actual_tick = y_mean + (base_tick / y_scale)
+
+                    # Format based on magnitude
+                    if abs(actual_tick) >= 10:
+                        tick_str = str(int(actual_tick))
+                    elif abs(actual_tick) >= 1:
+                        tick_str = f"{actual_tick:.1f}"
+                    else:
+                        tick_str = f"{actual_tick:.2f}"
+
+                    # Update text content only (no new object creation)
+                    text.text = tick_str
 
     def _get_channel_at_y(self, y_pixel):
         """Get the channel index at a given y pixel coordinate."""
@@ -750,23 +777,27 @@ class RealtimeViewer:
             # Get this channel's data
             channel_data = data[ch_idx, :]
 
-            # Update EEG std buffer and calculate std for impedance indicator
+            # Update channel statistics buffer (used for both mean and EEG std)
             channel_global_idx = self.channel_info.index(ch_info)
-            if channel_global_idx in self.eeg_std_buffer:
-                # Update rolling buffer with most recent data
-                buffer_size = len(self.eeg_std_buffer[channel_global_idx])
-                if len(channel_data) > 0:
-                    # Take last samples to fill buffer
-                    samples_to_use = min(buffer_size, len(channel_data))
-                    self.eeg_std_buffer[channel_global_idx] = np.roll(
-                        self.eeg_std_buffer[channel_global_idx], -samples_to_use
-                    )
-                    self.eeg_std_buffer[channel_global_idx][-samples_to_use:] = (
-                        channel_data[-samples_to_use:]
-                    )
+            buffer_size = len(self.channel_stats_buffer[channel_global_idx])
+            if len(channel_data) > 0:
+                # Take last samples to fill buffer
+                samples_to_use = min(buffer_size, len(channel_data))
+                self.channel_stats_buffer[channel_global_idx] = np.roll(
+                    self.channel_stats_buffer[channel_global_idx], -samples_to_use
+                )
+                self.channel_stats_buffer[channel_global_idx][-samples_to_use:] = (
+                    channel_data[-samples_to_use:]
+                )
 
-                    # Calculate std and update label with color-coded impedance
-                    std_val = np.std(self.eeg_std_buffer[channel_global_idx])
+                # Calculate running mean (for all channels)
+                y_mean = np.mean(self.channel_stats_buffer[channel_global_idx])
+                ch_info["y_mean"] = y_mean
+
+                # Calculate std for EEG channels (impedance indicator)
+                stream_name = self.streams[ch_info["stream_idx"]].name
+                if "EEG" in stream_name.upper():
+                    std_val = np.std(self.channel_stats_buffer[channel_global_idx])
                     for eeg_ch_idx, std_text in self.eeg_std_labels:
                         if eeg_ch_idx == channel_global_idx:
                             std_text.text = f"σ: {std_val:.1f}"
@@ -780,12 +811,13 @@ class RealtimeViewer:
                             break
 
             # Normalize to [-1, 1] range for consistent display
-            # Map [y_min, y_max] to [-1, 1]
-            y_min = ch_info["y_min"]
-            y_max = ch_info["y_max"]
-            y_range = y_max - y_min
-            normalized_data = 2.0 * (channel_data - y_min) / y_range - 1.0
-            normalized_data = np.clip(normalized_data, -1.0, 1.0)
+            # Center the signal around its mean, with y_range defining the vertical span
+            # Don't clip - let values go beyond limits so user knows when signal exceeds range
+            y_range = ch_info["y_range"]
+            y_mean = ch_info["y_mean"]
+
+            # Map [y_mean - y_range/2, y_mean + y_range/2] to [-1, 1]
+            normalized_data = 2.0 * (channel_data - y_mean) / y_range
 
             # Resample to fit display buffer if needed
             if len(normalized_data) != self.n_samples:
@@ -800,6 +832,10 @@ class RealtimeViewer:
 
         # Update vertex positions
         self.program["a_position"].set_data(self.data.T.ravel().astype(np.float32))
+
+        # Update y-tick labels to reflect new means (only update text, don't recreate)
+        self._update_y_tick_labels(create_new=False)
+
         self.canvas.update()
 
         # Check duration limit
