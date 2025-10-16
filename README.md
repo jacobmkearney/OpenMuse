@@ -15,9 +15,10 @@ This software allows recording, streaming via LSL and visualizing signals from t
 - [x] Record raw data to a file
 - [x] Decode raw data into a pandas DataFrame
 - [x] Stream data over LSL
-- [x] Visualize live LSL streams
+- [x] Visualise live LSL streams
+- [ ] Stream in battery signal and display battery level in visualizer
 - [ ] Validate timestamping accuracy experimentally: confirm we get time-locked ERPs
-- [ ] Validate best PPG signal extraction method
+- [ ] Validate the best PPG signal extraction method
 - [ ] Validate fNIRS signal extraction method
 
 ## Installation
