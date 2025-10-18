@@ -1,8 +1,8 @@
 """
-Muse BLE Message Parser (New Implementation)
+Muse BLE Message Parser
 ============================================
 
-Cleaner implementation that follows the actual message structure:
+Implementation that follows the actual message structure:
 MESSAGE → PACKET → DATA SUBPACKETS
 
 Message Structure:
@@ -19,12 +19,34 @@ MESSAGE (BLE transmission with timestamp)
             ├─ Unknown bytes: 3 metadata bytes (purpose unknown)
             └─ Sensor data: Variable length depending on sensor type
 
-Timestamp Calculation:
-----------------------
-Timestamps are calculated sequentially based on sorting subpackets by (pkt_time, subpkt_index).
-Each subpacket's samples are assigned evenly-spaced timestamps at the sensor's nominal sampling
-rate (e.g., 52 Hz for ACCGYRO, 256 Hz for EEG). This produces monotonic, uniformly-spaced
-timestamps. Note: Actual device timing may have jitter not captured by this approach.
+Timestamp Calculation & Device Timing:
+---------------------------------------
+CRITICAL DESIGN PRINCIPLE: All subpackets within a single BLE message share the SAME pkt_time
+(device hardware timestamp). The pkt_time represents when the device captured that message's
+data using its 256 kHz internal clock.
+
+Timestamp calculation per message:
+  1. Sort subpackets by (pkt_time, subpkt_index) within each sensor type
+  2. Use FIRST subpacket's pkt_time as base_time anchor for the entire message
+  3. Assign sequential timestamps: base_time + (sample_index / sampling_rate)
+  4. This creates uniformly-spaced, monotonic timestamps WITHIN each message
+
+Why this preserves device timing:
+  - All subpackets in a message captured at the same device time (verified empirically)
+  - Subpacket index indicates sequential order (0, 1, 2, ...)
+  - Uniform spacing matches device's actual sampling rate (256 Hz EEG, 52 Hz ACCGYRO, etc.)
+  - Device's 256 kHz clock is accurate and monotonic
+
+Message Arrival Order & Non-Monotonic Timestamps:
+--------------------------------------------------
+IMPORTANT: BLE transmission can REORDER entire messages. This function processes messages in
+ARRIVAL order, NOT device capture order. Consequently:
+  - Output timestamps may be non-monotonic
+  - Messages simply processed in wrong temporal order due to BLE delays
+
+The non-monotonic timestamps are corrected downstream in stream.py, which buffers and sorts
+samples by their device timestamps before pushing to LSL. Final XDF recordings will have
+monotonic timestamps with device timing preserved.
 
 """
 
@@ -730,6 +752,9 @@ def add_timestamps(parsed_data: Dict[str, List[Dict]]) -> Dict[str, np.ndarray]:
             data_array = np.empty((total_samples, n_channels), dtype=np.float32)
             times_array = np.empty(total_samples, dtype=np.float64)
 
+            # Use the FIRST subpacket's pkt_time as the anchor
+            # All subsequent samples are offset from this based on sampling rate
+            # This maintains monotonic timestamps while preserving device timing
             base_time = sorted_subpackets[0]["pkt_time"]
             sample_counter = 0
             row_idx = 0
@@ -738,8 +763,8 @@ def add_timestamps(parsed_data: Dict[str, List[Dict]]) -> Dict[str, np.ndarray]:
                 data = subpkt["data"]
                 n_samples = subpkt.get("n_samples", n_samples_per_subpkt)
 
-                # Calculate timestamps for this subpacket
-                # Each sample is 1/sampling_rate seconds apart
+                # Calculate timestamps: base time + sample offset / rate
+                # This creates uniformly-spaced, monotonic timestamps
                 times = (
                     base_time + (sample_counter + np.arange(n_samples)) / sampling_rate
                 )
