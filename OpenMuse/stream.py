@@ -41,23 +41,33 @@ The parse_message() function returns decoded data with THREE timestamp types:
    - These are the timestamps that appear in recorded XDF files
 
 Timestamp Conversion Flow:
----------------------------
+---------------------------------------------------------------------
     Device Time Domain              →           LSL Time Domain
     ==================                          ===============
 
     pkt_time (device seconds)                   LSL timestamps (seconds)
            ↓                                             ↑
-    timestamps = pkt_time + Δt      →→→→→   lsl_timestamps = device_times + offset
+    timestamps = pkt_time + Δt      →→→→→   Anchored timestamps
+                                             (preserving device timing)
 
     Where:
-    - Δt = sample_index / sampling_rate (uniform spacing)
-    - offset = lsl_now - first_device_time (calculated once at start)
-    - lsl_now = local_clock() (LSL synchronized time)
+    - Δt = sample_index / sampling_rate (uniform spacing from device)
+    - Device timestamps are first converted using initial offset
+    - Then re-anchored to current LSL time during flush to prevent drift
 
-The conversion is done in _queue_samples():
-    1. Extract device timestamps from decoded data array (first column)
-    2. Add device_to_lsl_offset (computed once from first packet)
-    3. Result: LSL-synchronized timestamps for each sample
+The conversion happens in two stages:
+
+1. _queue_samples(): Initial mapping
+    - Extract device timestamps from decoded data array (first column)
+    - Add device_to_lsl_offset (computed once from first packet)
+    - Store in buffer with device-relative timing preserved
+
+2. _flush_buffer(): Re-anchor to current LSL time
+    - Get current LSL time: lsl_now = local_clock()
+    - Calculate how long ago samples should have arrived
+    - Shift all timestamps to anchor oldest sample appropriately
+    - Preserves relative device timing while ensuring proper LSL synchronization
+    - Prevents timestamp drift when device was powered on long before recording
 
 Packet Reordering Buffer - Critical Design Component:
 ------------------------------------------------------
@@ -333,19 +343,54 @@ async def _stream_async(
         sorted_timestamps = all_timestamps[sort_indices]
         sorted_data = all_data[sort_indices]
 
-        # Push to LSL - ensure correct dtype (float32 for data, float64 for timestamps)
+        # Re-anchor timestamps to current LSL time while preserving device timing
+        #
+        # WHY: If the Muse device was powered on hours before LabRecorder started,
+        # the initial device_to_lsl_offset creates timestamps in the "past" relative
+        # to when recording actually begins. This causes sync issues with other devices.
+        #
+        # SOLUTION: Shift all timestamps so they're anchored to current LSL time,
+        # but preserve the relative timing between samples (device precision).
+        #
+        # BENEFITS:
+        # - Sub-millisecond device timing preserved (e.g., 4ms @ 250Hz)
+        # - Timestamps always near current LSL time (proper multi-device sync)
+        # - Compatible with LabRecorder clock offset collection
+        lsl_now = local_clock()
+        first_timestamp = sorted_timestamps[0]
+        time_span = sorted_timestamps[-1] - first_timestamp
+
+        # Calculate how long ago these samples should have been captured
+        # Account for: sample time span + half the buffer duration (typical delay)
+        expected_age = time_span + BUFFER_DURATION_SECONDS / 2
+
+        # Compute anchor point: where the oldest sample should be
+        # (in the past by expected_age seconds from now)
+        anchor_time = lsl_now - expected_age
+
+        # Calculate shift needed to move timestamps from their current position
+        # to the anchored position
+        timestamp_shift = anchor_time - first_timestamp
+
+        # Apply uniform shift to all timestamps
+        # This preserves all relative timing from the device while anchoring to LSL time
+        anchored_timestamps = sorted_timestamps + timestamp_shift
+
+        # Push to LSL with re-anchored timestamps
+        # This preserves device-level timing precision while ensuring proper
+        # synchronization with LabRecorder and other LSL streams
         try:
             stream.outlet.push_chunk(
                 x=sorted_data.astype(np.float32, copy=False),
-                timestamp=sorted_timestamps.astype(np.float64, copy=False),
+                timestamp=anchored_timestamps.astype(np.float64, copy=False),
                 pushThrough=True,
             )
-            samples_sent[sensor_type] += len(sorted_timestamps)
+            samples_sent[sensor_type] += len(anchored_timestamps)
 
-            # Log to JSON if requested - save exactly what was pushed to LSL
+            # Log to JSON if requested - save exactly what was pushed to LSL (with anchored timestamps)
             if stream.log_records is not None:
                 stream.log_records.append(
-                    (sorted_timestamps.copy(), sorted_data.copy())
+                    (anchored_timestamps.copy(), sorted_data.copy())
                 )
         except Exception as exc:
             if verbose:
@@ -381,12 +426,15 @@ async def _stream_async(
         device_times = data_array[:, 0]
 
         # Compute device-to-LSL time offset on first packet only
+        # This offset maps device time to LSL time domain
         if device_to_lsl_offset is None:
             device_to_lsl_offset = lsl_now - device_times[0]
             if verbose:
                 print(f"Initialized time offset: {device_to_lsl_offset:.3f} seconds")
 
-        # Store as numpy arrays (no conversion to list needed)
+        # Convert device timestamps to LSL time
+        # LSL time is the reference time domain used by all LSL streams
+        # This ensures proper synchronization with other LSL streams in LabRecorder
         lsl_timestamps = device_times + device_to_lsl_offset
         stream.buffer.append((lsl_timestamps, samples))
 
