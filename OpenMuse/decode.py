@@ -689,8 +689,9 @@ def make_timestamps(
     2. **Unified Wraparound Detection**: Apply 32-bit clock wraparound logic once across
        all subpackets, preventing false detections from cross-message inversions
 
-    3. **Monotonic Timestamp Generation**: Generate timestamps anchored to device time,
-       ensuring uniform spacing at declared sampling rates
+    3. **Stream-Relative Timestamp Generation**: Generate timestamps relative to stream start
+       (base_time = 0.0), ensuring uniform spacing at declared sampling rates while
+       maintaining device timing precision through tick-based calculations
 
     4. **State Management**: For streaming, maintain state across calls to handle ongoing
        data streams with correct wraparound detection
@@ -700,7 +701,8 @@ def make_timestamps(
     subpackets : List[Dict]
         List of subpacket dicts for a single sensor type
     base_time : float, optional
-        Base time for timestamp calculation. If None, uses first subpacket time.
+        Base time for timestamp calculation. If None, defaults to 0.0 for streaming
+        applications (relative to stream start) instead of device boot time.
     wrap_offset : int
         Current wraparound offset for 32-bit clock
     last_abs_tick : int
@@ -769,7 +771,10 @@ def make_timestamps(
 
         # Initialize rolling state for this sensor stream if not provided
         if base_time is None:
-            base_time = first_raw_tick / DEVICE_CLOCK_HZ
+            # For streaming applications, use 0 as base_time to make timestamps relative
+            # to when streaming started, not when device booted. This eliminates the
+            # need for re-anchoring in LSL streaming while preserving device timing precision.
+            base_time = 0.0
             wrap_offset = 0
             last_abs_tick = first_raw_tick
             sample_counter = 0
