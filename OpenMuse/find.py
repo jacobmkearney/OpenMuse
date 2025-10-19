@@ -24,3 +24,19 @@ def find_devices(timeout=10, verbose=True):
             print("No Muses found. Ensure the device is on and Bluetooth is enabled.")
 
     return muses
+
+
+def resolve_address(timeout: int = 10, verbose: bool = True) -> str:
+    """
+    Scan and return a single discovered Muse device address.
+
+    Returns the address if exactly one device is found. Raises ValueError if
+    zero or multiple devices are found.
+    """
+    devices = find_devices(timeout=timeout, verbose=verbose)
+    if len(devices) == 0:
+        raise ValueError("No Muse devices discovered. Ensure headset is on and in range.")
+    if len(devices) > 1:
+        raise ValueError("Multiple Muse devices discovered. Please specify --address to choose one.")
+
+    return devices[0]["address"]

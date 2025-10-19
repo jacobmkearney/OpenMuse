@@ -1,7 +1,7 @@
 import argparse
 import sys
 
-from .find import find_devices
+from .find import find_devices, resolve_address
 from .record import record
 
 
@@ -34,7 +34,7 @@ def main(argv=None):
         "record", help="Connect and record raw packets to a text file"
     )
     p_rec.add_argument(
-        "--address", required=True, help="Device address (e.g., MAC on Windows)"
+        "--address", required=False, help="Device address (e.g., MAC on Windows). Omit to autodiscover."
     )
     p_rec.add_argument(
         "--duration",
@@ -53,8 +53,14 @@ def main(argv=None):
     def handle_record(ns):
         if ns.duration <= 0:
             parser.error("--duration must be positive")
+
+        address = ns.address
+        if not address:
+            address = resolve_address()
+            print(f"Autodiscovered device: {address}")
+
         record(
-            address=ns.address,
+            address=address,
             duration=ns.duration,
             outfile=ns.outfile,
             preset=ns.preset,
@@ -71,8 +77,8 @@ def main(argv=None):
     )
     p_stream.add_argument(
         "--address",
-        required=True,
-        help="Device address (e.g., MAC on Windows)",
+        required=False,
+        help="Device address (e.g., MAC on Windows). Omit to autodiscover.",
     )
     p_stream.add_argument(
         "--preset",
@@ -98,8 +104,14 @@ def main(argv=None):
 
         if ns.duration is not None and ns.duration <= 0:
             parser.error("--duration must be positive when provided")
+        address = ns.address
+
+        if not address:
+            address = resolve_address()
+            print(f"Autodiscovered device: {address}")
+
         stream(
-            address=ns.address,
+            address=address,
             preset=ns.preset,
             duration=ns.duration,
             outfile=ns.outfile,
@@ -158,6 +170,9 @@ def main(argv=None):
     except KeyboardInterrupt:
         print("Interrupted.")
         return 130
+    except ValueError:
+        # Discovery raised a user-facing error; upstream already printed details
+        return 1
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
