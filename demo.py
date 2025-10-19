@@ -22,4 +22,4 @@ fig = data["ACCGYRO"].plot(
     title="ACC + GYRO Movement Data",
 )
 
-plt.savefig("example_accgyro.png")
+plt.savefig("media/example_accgyro.png")
