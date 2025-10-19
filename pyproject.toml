@@ -15,6 +15,7 @@ dependencies = [
   "mne-lsl>=1.10.0",
   "matplotlib>=3.5.0",
   "vispy>=0.14",
+  "PyQt6>=6.5",
 ]
 authors = [{ name = "" }]
 classifiers = [
