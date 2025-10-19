@@ -32,16 +32,24 @@ source .venv/bin/activate  # on MacOS or Linux
 .venv\Scripts\activate     # on Windows
 ```
 
-Install dependencies 
-
-``` bash
-pip install .
-```
-
-Install from GitHub by opening a terminal and running:
+For users: Install from GitHub by opening a terminal and running:
 
 ```powershell
 pip install https://github.com/DominiqueMakowski/OpenMuse/zipball/main
+```
+
+For contributors: If you want to make changes
+
+``` bash
+git clone https://github.com/DominiqueMakowski/OpenMuse.git
+cd OpenMuse
+
+python3 -m venv .venv
+
+source .venv/bin/activate  # on MacOS or Linux
+.venv\Scripts\activate     # on Windows
+
+pip install -e .
 ```
 
 ## Usage
@@ -64,6 +72,14 @@ This will print the MAC addresses of nearby Muse devices. Note the address of yo
 ```powershell
 OpenMuse record --address <your-muse-address> --duration 60 --outfile data.txt
 ```
+
+Alternatively, omit `--address` to autodiscover a single nearby device:
+
+```powershell
+OpenMuse record --duration 60 --outfile data.txt
+```
+
+If multiple devices are found (or none), you'll be asked to specify `--address`.
 
 > [!TIP]
 > By default, recording and streaming use the `--preset p1041`, which enables all channels. You can change the preset using the `--preset` argument (see below for the list of documented presets).
