@@ -136,7 +136,7 @@ BLE transmission can REORDER entire messages (not just individual packets). Anal
 
 **BUFFER OPERATION:**
 
-1. Samples held in buffer for BUFFER_DURATION_SECONDS (default: 250ms)
+1. Samples held in buffer for BUFFER_DURATION_SECONDS (default: 150ms)
 2. When buffer time limit reached, all buffered samples are:
    - Concatenated across packets/messages
    - **Sorted by device timestamp** (preserves device timing, corrects arrival order)
@@ -151,10 +151,11 @@ BLE transmission can REORDER entire messages (not just individual packets). Anal
 
 **BUFFER SIZE RATIONALE:**
 - Original: 80ms (insufficient for ~90ms delays observed in data)
-- Current: 250ms (captures nearly all out-of-order messages)
-- Trade-off: Latency (250ms delay) vs. timestamp quality (monotonic output)
-- For real-time applications: reduce buffer size, accept some non-monotonic timestamps
-- For recording quality: keep 250ms+ buffer for perfect temporal ordering
+- Previous: 250ms (captures nearly all out-of-order messages)
+- Current: 150ms (balances low latency with high temporal ordering accuracy)
+- Trade-off: Latency (150ms delay) vs. timestamp quality (near-perfect monotonic output)
+- For real-time applications: can reduce further, accept some non-monotonic timestamps
+- For recording quality: 150ms provides excellent temporal ordering
 
 Timestamp Quality & Device Timing Preservation:
 ------------------------------------------------
@@ -253,11 +254,12 @@ OPTICS_LABELS: tuple[str, ...] = OPTICS_CHANNELS
 #   - Smaller buffer (80ms):  Lower latency, but ~1-2% non-monotonic timestamps in output
 #   - Larger buffer (250ms+): Higher latency, but nearly 0% non-monotonic (perfect ordering)
 #
-# Current: 250ms captures nearly all out-of-order messages while maintaining acceptable latency
-BUFFER_DURATION_SECONDS = 0.25
+# Current: 150ms balances low latency with high temporal ordering accuracy
+# With stream-relative timestamps, we can reduce from 250ms while maintaining quality
+BUFFER_DURATION_SECONDS = 0.15
 
 # Maximum number of BLE packets to buffer before forcing a flush (safety limit)
-MAX_BUFFER_PACKETS = 10
+MAX_BUFFER_PACKETS = 8
 
 
 @dataclass
