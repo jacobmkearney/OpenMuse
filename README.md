@@ -23,6 +23,21 @@ This software allows recording, streaming via LSL and visualizing signals from t
 
 ## Installation
 
+Create a virtual environment 
+
+``` bash
+python3 -m venv .venv
+
+source .venv/bin/activate  # on MacOS or Linux
+.venv\Scripts\activate     # on Windows
+```
+
+Install dependencies 
+
+``` bash
+pip install .
+```
+
 Install from GitHub by opening a terminal and running:
 
 ```powershell
