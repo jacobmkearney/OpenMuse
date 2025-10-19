@@ -167,13 +167,19 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Dict
 
 import bleak
 import numpy as np
 
 from .backends import _run
-from .decode import ACCGYRO_CHANNELS, EEG_CHANNELS, OPTICS_CHANNELS, parse_message
+from .decode import (
+    ACCGYRO_CHANNELS,
+    EEG_CHANNELS,
+    OPTICS_CHANNELS,
+    make_timestamps,
+    parse_message,
+)
 from .muse import MuseS
 from .utils import configure_lsl_api_cfg, get_utc_timestamp
 
@@ -321,6 +327,10 @@ async def _stream_async(
 ) -> None:
     sensor_streams = _build_sensor_streams(enable_logging=outfile is not None)
     samples_sent = {name: 0 for name in sensor_streams}
+    # State for timestamping: sensor_type -> (base_time, wrap_offset, last_abs_tick, sample_counter)
+    timestamp_states: Dict[str, tuple[Optional[float], int, int, int]] = {
+        sensor: (None, 0, 0, 0) for sensor in sensor_streams.keys()
+    }
 
     # Compute device-to-LSL time offset once at the start
     # Will be updated with the first data packet
@@ -381,7 +391,7 @@ async def _stream_async(
         # synchronization with LabRecorder and other LSL streams
         try:
             stream.outlet.push_chunk(
-                x=sorted_data.astype(np.float32, copy=False),
+                x=sorted_data.astype(np.float32, copy=False),  # type: ignore[arg-type]
                 timestamp=anchored_timestamps.astype(np.float64, copy=False),
                 pushThrough=True,
             )
@@ -452,11 +462,21 @@ async def _stream_async(
             _flush_buffer(sensor_type)
 
     def _on_data(_, data: bytearray):
-        nonlocal device_to_lsl_offset
+        nonlocal device_to_lsl_offset, timestamp_states
         try:
             # Both EEG and ACC/GYRO data come through EEG characteristic
             message = f"{get_utc_timestamp()}\t{MuseS.EEG_UUID}\t{data.hex()}"
-            decoded = parse_message(message)
+            subpackets = parse_message(message)
+
+            # Apply timestamps for each sensor type
+            decoded = {}
+            for sensor_type, pkt_list in subpackets.items():
+                if sensor_type in timestamp_states:
+                    array, *new_state = make_timestamps(
+                        pkt_list, *timestamp_states[sensor_type]
+                    )
+                    decoded[sensor_type] = array
+                    timestamp_states[sensor_type] = (new_state[0], new_state[1], new_state[2], new_state[3])  # type: ignore
         except Exception as exc:
             if verbose:
                 print(f"Decoding error: {exc}")

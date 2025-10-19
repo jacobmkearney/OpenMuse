@@ -40,7 +40,8 @@ Hardware Timing Artifacts:
 """
 
 import struct
-from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Union
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -179,9 +180,9 @@ def _select_optics_channels(count: int) -> List[str]:
     return [f"OPTICS_{i+1:02d}" for i in range(count)]
 
 
-def parse_message(message: str) -> Dict[str, np.ndarray]:
+def parse_message(message: str) -> Dict[str, List[Dict]]:
     """
-    Parse a BLE message into structured data with timestamps.
+    Parse a BLE message into structured data.
 
     This parser follows the actual message structure:
     MESSAGE → PACKET (14-byte header) → DATA SUBPACKETS (TAG + 4-byte header + data)
@@ -193,19 +194,9 @@ def parse_message(message: str) -> Dict[str, np.ndarray]:
 
     Returns:
     --------
-    dict : Dictionary with sensor types as keys, numpy arrays as values
+    dict : Dictionary with sensor types as keys, lists of subpacket dicts as values
         Keys: "EEG", "ACCGYRO", "Optics", "Battery", "Unknown"
-        Each array has shape (total_samples, n_channels + 1)
-        First column is timestamp, remaining columns are sensor data
-
-    Example:
-    --------
-    >>> message = "2024-01-01T12:00:00Z\\tUUID\\t..."
-    >>> data = parse_message(message)
-    >>> data["ACCGYRO"]  # shape (3, 7): time + 6 channels
-    array([[13707.349, 0.001, -0.002, ...],
-           [13707.368, 0.001, -0.002, ...],
-           [13707.387, 0.001, -0.002, ...]])
+        Each list contains subpacket dictionaries with decoded sensor data
     """
 
     # Parse message line
@@ -215,7 +206,7 @@ def parse_message(message: str) -> Dict[str, np.ndarray]:
         payload = bytes.fromhex(hexstring.strip())
     except (ValueError, AttributeError):
         # Malformed message
-        return _empty_result_arrays()
+        return _empty_result()
 
     # Initialize result dictionary for parsed subpackets
     parsed_data = _empty_result()
@@ -246,8 +237,8 @@ def parse_message(message: str) -> Dict[str, np.ndarray]:
 
                 parsed_data[sensor_type].append(decoded)
 
-    # Step 4: Add timestamps and convert to numpy arrays
-    return add_timestamps(parsed_data)
+    # Return raw subpackets for global timestamping
+    return parsed_data
 
 
 def _empty_result() -> Dict[str, List]:
@@ -670,133 +661,179 @@ def _decode_optics_data(data_bytes: bytes, n_channels: int) -> Optional[np.ndarr
 # ============================================================================
 # Timestamp Resampling Functions
 # ============================================================================
+# Convenience Functions
+# ============================================================================
 
 
-def add_timestamps(parsed_data: Dict[str, List[Dict]]) -> Dict[str, np.ndarray]:
+def make_timestamps(
+    subpackets: List[Dict],
+    base_time: Optional[float] = None,
+    wrap_offset: int = 0,
+    last_abs_tick: int = 0,
+    sample_counter: int = 0,
+) -> tuple[np.ndarray, float, int, int, int]:
     """
-    Add timestamps to parsed data and return as numpy arrays.
+    Add timestamps to a list of subpackets for a single sensor type and return as numpy array.
 
-    Generates uniform timestamps using: timestamp[i] = first_pkt_time + (sample_index / sampling_rate)
+    This implements global timestamping: all subpackets are sorted by device time before
+    applying wraparound detection and timestamp generation. This prevents artificial gaps
+    that occur when per-message timestamping triggers false wraparound detection due to
+    timing inversions between messages.
 
-    This prioritizes temporal consistency over exact hardware timestamps:
-    - Uniform sample spacing (matches declared sampling rate)
-    - Sequential within each message
-    - Predictable for analysis
+    Global Timestamping Logic:
+    --------------------------
+    1. **Global Sorting**: Sort ALL subpackets by (pkt_time_raw, pkt_index, subpkt_index)
+       - Ensures correct temporal order across message boundaries
+       - Handles BLE packet reordering and timing jitter
 
-    Packet Ordering:
-    ----------------
-    Sorts by (pkt_time, pkt_index, subpkt_index):
-    - pkt_index: Packet sequence counter (0-255, wraps)
-    - Handles ~11-30% of packets with duplicate pkt_time values
-    - Validated: 100% sequential in 1,871 duplicate groups across 15 test files
+    2. **Unified Wraparound Detection**: Apply 32-bit clock wraparound logic once across
+       all subpackets, preventing false detections from cross-message inversions
 
-    Note: ~4% of pkt_time values have timing inversions (hardware artifacts from
-    async buffering). These are corrected downstream in stream.py via buffering/sorting
-    before LSL output.
+    3. **Monotonic Timestamp Generation**: Generate timestamps anchored to device time,
+       ensuring uniform spacing at declared sampling rates
+
+    4. **State Management**: For streaming, maintain state across calls to handle ongoing
+       data streams with correct wraparound detection
 
     Parameters:
     -----------
-    parsed_data : dict
-        Output from parse_message() containing lists of subpackets per sensor type
+    subpackets : List[Dict]
+        List of subpacket dicts for a single sensor type
+    base_time : float, optional
+        Base time for timestamp calculation. If None, uses first subpacket time.
+    wrap_offset : int
+        Current wraparound offset for 32-bit clock
+    last_abs_tick : int
+        Last absolute tick value for wraparound detection
+    sample_counter : int
+        Current sample counter for monotonic timestamping
 
     Returns:
     --------
-    dict : Dictionary with sensor types as keys, numpy arrays as values
-        Each array has shape (total_samples, n_channels + 1)
-        First column is timestamp, remaining columns are sensor data
+    tuple : (array, base_time, wrap_offset, last_abs_tick, sample_counter)
+        array : np.ndarray with shape (total_samples, n_channels + 1)
+            First column is timestamp, remaining columns are sensor data
+        base_time, wrap_offset, last_abs_tick, sample_counter : Updated state values
     """
-    result = {}
+    if len(subpackets) == 0:
+        if base_time is None:
+            base_time = 0.0
+        return np.empty((0, 0)), base_time, wrap_offset, last_abs_tick, sample_counter
 
-    # Process each sensor type
-    for sensor_type, subpackets in parsed_data.items():
-        if len(subpackets) == 0:
-            result[sensor_type] = np.empty((0, 0))
-            continue
+    # Get sensor configuration from first subpacket
+    first_tag = subpackets[0].get("tag_byte")
+    config = SENSORS.get(first_tag, {}) if first_tag else {}
+    sampling_rate = config.get("rate", 1.0)
+    n_samples_per_subpkt = config.get("n_samples", 1)
 
-        # Get sensor configuration from first subpacket
-        first_tag = subpackets[0].get("tag_byte")
-        config = SENSORS.get(first_tag, {}) if first_tag else {}
-        sampling_rate = config.get("rate", 1.0)
-        n_samples_per_subpkt = config.get("n_samples", 1)
+    # Sort all subpackets globally by device timestamp and sequence indices
+    sorted_subpackets = sorted(
+        subpackets,
+        key=lambda s: (
+            s.get("pkt_time_raw", 0),
+            s["pkt_index"],
+            s["subpkt_index"] if s["subpkt_index"] is not None else -1,
+        ),
+    )
 
-        # Sort subpackets by (pkt_time, pkt_index, subpkt_index)
-        # pkt_index orders packets with identical pkt_time (100% reliable in testing)
-        # None for subpkt_index treated as -1 (first subpacket within packet)
-        sorted_subpackets = sorted(
-            subpackets,
-            key=lambda s: (
-                s["pkt_time"],
-                s["pkt_index"],
-                s["subpkt_index"] if s["subpkt_index"] is not None else -1,
-            ),
+    # Efficiently collect all data arrays and assign sequential timestamps
+    if len(sorted_subpackets) == 0:
+        if base_time is None:
+            base_time = 0.0
+        return np.empty((0, 0)), base_time, wrap_offset, last_abs_tick, sample_counter
+    else:
+        # Pre-calculate total samples to pre-allocate arrays
+        total_samples = sum(
+            subpkt.get("n_samples", n_samples_per_subpkt)
+            for subpkt in sorted_subpackets
         )
 
-        # Efficiently collect all data arrays and assign sequential timestamps
-        if len(sorted_subpackets) == 0:
-            data_array = np.empty((0, 0))
-            times_array = np.empty((0,))
+        # Get number of channels from first subpacket
+        # Handle both 1D and 2D arrays (Battery data is 1D)
+        first_data = sorted_subpackets[0]["data"]
+        if first_data.ndim == 1:
+            n_channels = 1
+            # Ensure 1D arrays are reshaped for consistency
+            for subpkt in sorted_subpackets:
+                if subpkt["data"].ndim == 1:
+                    subpkt["data"] = subpkt["data"].reshape(-1, 1)
         else:
-            # Pre-calculate total samples to pre-allocate arrays
-            total_samples = sum(
-                subpkt.get("n_samples", n_samples_per_subpkt)
-                for subpkt in sorted_subpackets
+            n_channels = first_data.shape[1]
+
+        # Pre-allocate arrays for efficiency
+        data_array = np.empty((total_samples, n_channels), dtype=np.float32)
+        times_array = np.empty(total_samples, dtype=np.float64)
+
+        clock_mod = 1 << 32
+        first_raw_tick = sorted_subpackets[0]["pkt_time_raw"]
+
+        # Initialize rolling state for this sensor stream if not provided
+        if base_time is None:
+            base_time = first_raw_tick / DEVICE_CLOCK_HZ
+            wrap_offset = 0
+            last_abs_tick = first_raw_tick
+            sample_counter = 0
+
+        # Track base tick for precision (avoid accumulating floating point error)
+        base_tick = first_raw_tick
+
+        row_idx = 0
+
+        for subpkt in sorted_subpackets:
+            data = subpkt["data"]
+            n_samples = subpkt.get("n_samples", n_samples_per_subpkt)
+            raw_tick = subpkt.get("pkt_time_raw", first_raw_tick)
+
+            # Expand 32-bit tick into monotonically increasing absolute tick
+            abs_tick = raw_tick + wrap_offset
+            if abs_tick < last_abs_tick:
+                wrap_offset += clock_mod
+                abs_tick = raw_tick + wrap_offset
+            last_abs_tick = abs_tick
+
+            # Use high-precision arithmetic to avoid floating point accumulation errors
+            # Calculate time difference from stream start using ticks for precision
+            tick_diff = abs_tick - base_tick
+            time_diff = tick_diff / DEVICE_CLOCK_HZ
+
+            # Convert to sample index with high precision
+            # Use floating point division but minimize operations
+            relative_samples_float = time_diff * sampling_rate
+            relative_samples = int(round(relative_samples_float))
+
+            # Maintain monotonic sample indices (original behavior)
+            # This handles hardware timestamp limitations where multiple subpackets
+            # may share identical timestamps
+            if relative_samples < sample_counter:
+                relative_samples = sample_counter
+
+            # Generate uniform timestamps anchored to stream start (original behavior)
+            # Hardware timestamps are used for ordering only, not for actual sample timing
+            times = (
+                base_time + (relative_samples + np.arange(n_samples)) / sampling_rate
             )
 
-            # Get number of channels from first subpacket
-            # Handle both 1D and 2D arrays (Battery data is 1D)
-            first_data = sorted_subpackets[0]["data"]
-            if first_data.ndim == 1:
-                n_channels = 1
-                # Ensure 1D arrays are reshaped for consistency
-                for subpkt in sorted_subpackets:
-                    if subpkt["data"].ndim == 1:
-                        subpkt["data"] = subpkt["data"].reshape(-1, 1)
-            else:
-                n_channels = first_data.shape[1]
+            # Copy data and timestamps into pre-allocated arrays
+            data_array[row_idx : row_idx + n_samples] = data
+            times_array[row_idx : row_idx + n_samples] = times
 
-            # Pre-allocate arrays for efficiency
-            data_array = np.empty((total_samples, n_channels), dtype=np.float32)
-            times_array = np.empty(total_samples, dtype=np.float64)
+            # Update sample counter
+            sample_counter = relative_samples + n_samples
+            row_idx += n_samples
 
-            # Get first packet timestamp as anchor point
-            first_pkt_time = sorted_subpackets[0]["pkt_time"]
-
-            # Generate sequential timestamps using sample counter
-            # This ensures uniform spacing and monotonicity
-            sample_counter = 0
-            row_idx = 0
-
-            for subpkt in sorted_subpackets:
-                data = subpkt["data"]
-                n_samples = subpkt.get("n_samples", n_samples_per_subpkt)
-
-                # Generate timestamps: first_pkt_time + (sample_index / sampling_rate)
-                times = (
-                    first_pkt_time
-                    + (sample_counter + np.arange(n_samples)) / sampling_rate
-                )
-
-                # Copy data and timestamps into pre-allocated arrays
-                data_array[row_idx : row_idx + n_samples] = data
-                times_array[row_idx : row_idx + n_samples] = times
-
-                # Increment counters
-                sample_counter += n_samples
-                row_idx += n_samples
-
-        # Add timestamps as first column
-        if data_array.size > 0:
-            times_col = times_array.reshape(-1, 1).astype(np.float64)
-            result[sensor_type] = np.hstack((times_col, data_array))
-        else:
-            result[sensor_type] = np.empty((0, 0))
-
-    return result
-
-
-# ============================================================================
-# Convenience Functions
-# ============================================================================
+    # Add timestamps as first column
+    assert base_time is not None  # Should always be set by now
+    if data_array.size > 0:
+        times_col = times_array.reshape(-1, 1).astype(np.float64)
+        return (
+            np.hstack((times_col, data_array)),
+            base_time,
+            wrap_offset,
+            last_abs_tick,
+            sample_counter,
+        )
+    else:
+        return np.empty((0, 0)), base_time, wrap_offset, last_abs_tick, sample_counter
 
 
 def decode_rawdata(messages: List[str]) -> Dict[str, pd.DataFrame]:
@@ -834,26 +871,30 @@ def decode_rawdata(messages: List[str]) -> Dict[str, pd.DataFrame]:
     """
     import pandas as pd
 
-    # Parse all messages (each returns numpy arrays with timestamps)
-    all_arrays = {key: [] for key in ["EEG", "ACCGYRO", "Optics", "Battery", "Unknown"]}
+    # Collect all subpackets from all messages
+    all_subpackets = {
+        key: [] for key in ["EEG", "ACCGYRO", "Optics", "Battery", "Unknown"]
+    }
 
     for message in messages:
         parsed = parse_message(message)
-        for sensor_type, data_array in parsed.items():
-            if data_array.size > 0:
-                all_arrays[sensor_type].append(data_array)
+        for sensor_type, subpacket_list in parsed.items():
+            all_subpackets[sensor_type].extend(subpacket_list)
+
+    # Add global timestamps
+    all_arrays = {}
+    for sensor_type, subpackets in all_subpackets.items():
+        array, _, _, _, _ = make_timestamps(subpackets)
+        all_arrays[sensor_type] = array
 
     # Convert to DataFrames
     result = {}
 
-    for sensor_type, arrays in all_arrays.items():
-        if len(arrays) == 0:
+    for sensor_type, data_array in all_arrays.items():
+        if data_array.size == 0:
             # Empty DataFrame for this sensor type
             result[sensor_type] = pd.DataFrame()
             continue
-
-        # Concatenate all arrays for this sensor type
-        data_array = np.vstack(arrays)
 
         # Create column names based on sensor type
         n_cols = data_array.shape[1]

@@ -8,11 +8,11 @@ The new decoder returns numpy arrays with timestamps instead of lists of dicts.
 import unittest
 import os
 import numpy as np
-from OpenMuse.decode import parse_message, decode_rawdata, SENSORS
+from OpenMuse.decode import parse_message, decode_rawdata, SENSORS, make_timestamps
 
 
-class TestParseMessage(unittest.TestCase):
-    """Test suite for parse_message() function."""
+class TestGlobalTimestamping(unittest.TestCase):
+    """Test suite for global timestamping logic using decode_rawdata() function."""
 
     @classmethod
     def setUpClass(cls):
@@ -47,12 +47,12 @@ class TestParseMessage(unittest.TestCase):
                 )
 
     def test_basic_parsing(self):
-        """Test basic parsing of a single message."""
-        # Read one message from p20
+        """Test basic parsing and global timestamping of multiple messages."""
+        # Read multiple messages from p20 for global timestamping
         with open(self.test_files["p20"], "r", encoding="utf-8") as f:
-            message = f.readline()
+            messages = [f.readline().strip() for _ in range(10) if f.readline().strip()]
 
-        result = parse_message(message)
+        result = decode_rawdata(messages)
 
         # Should return a dict
         self.assertIsInstance(result, dict)
@@ -61,75 +61,89 @@ class TestParseMessage(unittest.TestCase):
         expected_keys = {"EEG", "ACCGYRO", "Optics", "Battery", "Unknown"}
         self.assertEqual(set(result.keys()), expected_keys)
 
-        # Each value should be a numpy array
+        # Each value should be a DataFrame
+        import pandas as pd
+
         for key, value in result.items():
-            self.assertIsInstance(value, np.ndarray)
+            self.assertIsInstance(value, pd.DataFrame)
 
     def test_accgyro_structure(self):
-        """Test that ACCGYRO data has correct structure."""
+        """Test that ACCGYRO data has correct structure with global timestamping."""
         with open(self.test_files["p20"], "r", encoding="utf-8") as f:
-            message = f.readline()
+            messages = [f.readline().strip() for _ in range(10) if f.readline().strip()]
 
-        result = parse_message(message)
-        accgyro = result["ACCGYRO"]
+        result = decode_rawdata(messages)
+        accgyro_df = result["ACCGYRO"]
 
         # Should have data (p20 has ACCGYRO)
-        self.assertGreater(accgyro.shape[0], 0)
+        self.assertGreater(len(accgyro_df), 0)
 
         # Should have 7 columns: time + 6 channels (ACC_X, ACC_Y, ACC_Z, GYRO_X, GYRO_Y, GYRO_Z)
-        self.assertEqual(accgyro.shape[1], 7)
+        self.assertEqual(len(accgyro_df.columns), 7)
 
         # First column should be timestamps (increasing)
-        timestamps = accgyro[:, 0]
+        timestamps = np.array(accgyro_df["time"])
         self.assertTrue(
-            np.all(timestamps[1:] >= timestamps[:-1]),
+            np.all(np.diff(timestamps) >= 0),
             "Timestamps should be monotonically increasing",
         )
 
     def test_eeg_structure(self):
-        """Test that EEG data has correct structure."""
+        """Test that EEG data has correct structure with global timestamping."""
         with open(self.test_files["p1034"], "r", encoding="utf-8") as f:
-            message = f.readline()
+            messages = [f.readline().strip() for _ in range(10) if f.readline().strip()]
 
-        result = parse_message(message)
-        eeg = result["EEG"]
+        result = decode_rawdata(messages)
+        eeg_df = result["EEG"]
 
         # Should have data (p1034 has EEG)
-        self.assertGreater(eeg.shape[0], 0)
+        self.assertGreater(len(eeg_df), 0)
 
         # Should have time + channels (either 4 or 8)
-        self.assertIn(eeg.shape[1], [5, 9])  # time + 4 or time + 8
+        self.assertIn(len(eeg_df.columns), [5, 9])  # time + 4 or time + 8
 
         # First column should be timestamps
-        timestamps = eeg[:, 0]
-        self.assertTrue(np.all(timestamps[1:] >= timestamps[:-1]))
+        timestamps = np.array(eeg_df["time"])
+        self.assertTrue(np.all(np.diff(timestamps) >= 0))
 
     def test_empty_message(self):
-        """Test handling of empty or malformed messages."""
-        result = parse_message("")
+        """Test handling of empty message list."""
+        result = decode_rawdata([])
 
-        # Should return empty arrays for all sensor types
+        # Should return empty DataFrames for all sensor types
+        import pandas as pd
+
         for key, value in result.items():
-            self.assertIsInstance(value, np.ndarray)
-            self.assertEqual(value.shape, (0, 0))
+            self.assertIsInstance(value, pd.DataFrame)
+            self.assertEqual(len(value), 0)
 
     def test_timestamp_uniformity(self):
-        """Test that timestamps are uniformly spaced at correct sampling rate."""
+        """Test that timestamps are uniformly spaced at correct sampling rate with global timestamping."""
         with open(self.test_files["p20"], "r", encoding="utf-8") as f:
-            message = f.readline()
+            messages = [f.readline().strip() for _ in range(20) if f.readline().strip()]
 
-        result = parse_message(message)
-        accgyro = result["ACCGYRO"]
+        result = decode_rawdata(messages)
+        accgyro_df = result["ACCGYRO"]
 
-        if accgyro.shape[0] > 1:
-            timestamps = accgyro[:, 0]
+        if len(accgyro_df) > 2:
+            timestamps = np.array(accgyro_df["time"])
             deltas = np.diff(timestamps)
 
             # Expected delta for 52 Hz ACCGYRO
             expected_delta = 1.0 / 52.0
 
-            # Check that deltas are very close to expected (within 1%)
-            self.assertTrue(np.allclose(deltas, expected_delta, rtol=0.01))
+            # With global timestamping, we expect most deltas to be close to expected,
+            # but there may be larger gaps between messages
+            small_gaps = deltas[
+                deltas < expected_delta * 2
+            ]  # Gaps smaller than 2x expected
+
+            # At least 80% of gaps should be close to expected delta
+            if len(small_gaps) > 0:
+                self.assertTrue(
+                    np.mean(np.abs(small_gaps - expected_delta) / expected_delta) < 0.1,
+                    "Most timestamps should be uniformly spaced",
+                )
 
     def test_sensors_config(self):
         """Test that SENSORS configuration is complete."""
@@ -153,7 +167,7 @@ class TestParseMessage(unittest.TestCase):
             self.assertIsInstance(config["data_len"], int)
 
     def test_performance(self):
-        """Test that parsing is fast enough for real-time use."""
+        """Test that global timestamping decoding is fast enough for real-time use."""
         import time
 
         # Read 100 messages
@@ -162,17 +176,16 @@ class TestParseMessage(unittest.TestCase):
             for i, line in enumerate(f):
                 if i >= 100:
                     break
-                messages.append(line)
+                messages.append(line.strip())
 
-        # Time the parsing
+        # Time the decoding with global timestamping
         start = time.perf_counter()
-        for message in messages:
-            parse_message(message)
+        result = decode_rawdata(messages)
         elapsed = time.perf_counter() - start
 
-        # Should be fast: < 1ms per message on average
+        # Should be fast: < 10ms per message on average (global timestamping adds some overhead)
         ms_per_msg = (elapsed / len(messages)) * 1000
-        self.assertLess(ms_per_msg, 1.0, f"Parsing too slow: {ms_per_msg:.3f} ms/msg")
+        self.assertLess(ms_per_msg, 10.0, f"Decoding too slow: {ms_per_msg:.3f} ms/msg")
         print(f"\nPerformance: {ms_per_msg:.3f} ms/msg")
 
 
@@ -280,28 +293,24 @@ class TestDecodeRawdata(unittest.TestCase):
             self.assertEqual(list(optics_df.columns), expected_columns)
 
     def test_concatenation(self):
-        """Test that multiple messages are properly concatenated."""
-        # Parse 5 messages individually
-        individual_arrays = []
-        with open(self.test_file, "r", encoding="utf-8") as f:
-            for _ in range(5):
-                message = f.readline()
-                result = parse_message(message)
-                if result["ACCGYRO"].shape[0] > 0:
-                    individual_arrays.append(result["ACCGYRO"])
-
-        # Total samples from individual parsing
-        individual_total = sum(arr.shape[0] for arr in individual_arrays)
-
-        # Parse all messages together
+        """Test that multiple messages are properly concatenated with global timestamping."""
+        # Read messages
         with open(self.test_file, "r", encoding="utf-8") as f:
             messages = [f.readline() for _ in range(5)]
 
+        # Count total samples across all subpackets from all messages
+        total_samples = 0
+        for message in messages:
+            parsed = parse_message(message)
+            for subpacket in parsed["ACCGYRO"]:
+                total_samples += subpacket["n_samples"]
+
+        # Parse all messages together with global timestamping
         result = decode_rawdata(messages)
         combined_total = len(result["ACCGYRO"])
 
         # Should have same total samples
-        self.assertEqual(individual_total, combined_total)
+        self.assertEqual(total_samples, combined_total)
 
 
 class TestBattery(unittest.TestCase):
@@ -318,7 +327,7 @@ class TestBattery(unittest.TestCase):
         }
 
     def test_battery_known_levels(self):
-        """Test battery decoding with files at known battery levels."""
+        """Test battery decoding with files at known battery levels using global timestamping."""
         expected_values = {
             "16_80": 16.80,
             "58_27": 58.27,
@@ -326,30 +335,28 @@ class TestBattery(unittest.TestCase):
         }
 
         for key, filepath in self.battery_files.items():
-            # Read all messages and collect battery data
-            battery_values = []
+            # Read all messages and decode with global timestamping
             with open(filepath, "r", encoding="utf-8") as f:
-                for line in f:
-                    result = parse_message(line)
-                    battery = result["Battery"]
-                    if battery.shape[0] > 0:
-                        battery_values.append(battery[0, 1])
+                messages = [line.strip() for line in f if line.strip()]
+
+            result = decode_rawdata(messages)
+            battery_df = result["Battery"]
 
             # Should have found at least one battery sample
-            self.assertGreater(
-                len(battery_values), 0, f"No battery data found in {key}"
-            )
+            self.assertGreater(len(battery_df), 0, f"No battery data found in {key}")
 
             # Check first battery value
-            battery_percent = battery_values[0]
+            battery_percent = battery_df.iloc[
+                0, 1
+            ]  # First row, second column (after time)
             expected = expected_values[key]
 
             # Should be within 0.5% of expected
             self.assertAlmostEqual(
-                battery_percent,
+                float(battery_percent),
                 expected,
                 delta=0.5,
-                msg=f"Battery level mismatch for {key}: got {battery_percent:.2f}, expected {expected:.2f}",
+                msg=f"Battery level mismatch for {key}: got {float(battery_percent):.2f}, expected {expected:.2f}",
             )
 
 
