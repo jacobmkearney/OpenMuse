@@ -15,8 +15,59 @@ Streaming Architecture:
 5. Buffer is periodically flushed: samples sorted by timestamp and pushed to LSL
 6. LSL outlets broadcast data to any connected LSL clients (e.g., LabRecorder)
 
-Timestamp Handling - Three Time Indices:
------------------------------------------
+Timestamp Handling - Stream-Relative Timing:
+-----------------------------------------------
+Timestamps are now generated relative to when streaming starts (base_time = 0.0),
+not when the Muse device was powered on. This eliminates the need for complex
+re-anchoring while maintaining precise device timing.
+
+The parse_message() function returns decoded data with THREE timestamp types:
+
+1. **message_time** (datetime)
+   - When the BLE message was received on the computer
+   - Format: UTC datetime from get_utc_timestamp()
+   - Source: Computer system clock
+   - Used for: Debugging, logging
+   - NOT used for: LSL timestamps
+
+2. **pkt_time** (float, seconds)
+   - When samples were captured on the Muse device
+   - Format: Seconds since device boot (from 256 kHz device clock)
+   - Source: Extracted from packet header (4-byte timestamp)
+   - Used for: Calculating relative timing between samples
+   - Device timing precision preserved through tick differences
+
+3. **timestamps** (array column in decoded data)
+   - Per-sample timestamps relative to stream start
+   - Format: Seconds, uniformly spaced at nominal sampling rate
+   - Source: 0.0 + (sample_index / sampling_rate) based on device timing
+   - Used for: Final LSL timestamps
+   - Naturally synchronized with other LSL streams
+
+Simplified Timestamp Conversion Flow:
+-------------------------------------
+    Device Time Domain          →       LSL Time Domain
+    ==================                  ===============
+
+    Stream-relative timestamps          LSL timestamps
+    (base_time = 0.0)          →→→→→   (anchored to LSL time)
+
+    Where:
+    - Timestamps start from 0 when streaming begins
+    - Device timing precision preserved through 256kHz clock tick differences
+    - Natural LSL synchronization without artificial re-anchoring
+
+The conversion happens in two stages:
+
+1. _queue_samples(): LSL time mapping
+    - Extract stream-relative timestamps from decoded data
+    - Add device_to_lsl_offset (maps stream start to LSL time)
+    - Store in buffer with preserved device timing
+
+2. _flush_buffer(): Conditional re-anchoring (rare)
+    - Check if timestamps are already near current LSL time
+    - Only apply re-anchoring for edge cases (timestamps >30s in past)
+    - Preserves device timing precision while ensuring LSL compatibility
 The parse_message() function returns decoded data with THREE timestamp types:
 
 1. **message_time** (datetime)
@@ -51,23 +102,21 @@ Timestamp Conversion Flow:
                                              (preserving device timing)
 
     Where:
-    - Δt = sample_index / sampling_rate (uniform spacing from device)
-    - Device timestamps are first converted using initial offset
-    - Then re-anchored to current LSL time during flush to prevent drift
+    - Timestamps start from 0 when streaming begins
+    - Device timing precision preserved through 256kHz clock tick differences
+    - Natural LSL synchronization without artificial re-anchoring
 
 The conversion happens in two stages:
 
-1. _queue_samples(): Initial mapping
-    - Extract device timestamps from decoded data array (first column)
-    - Add device_to_lsl_offset (computed once from first packet)
-    - Store in buffer with device-relative timing preserved
+1. _queue_samples(): LSL time mapping
+    - Extract stream-relative timestamps from decoded data
+    - Add device_to_lsl_offset (maps stream start to LSL time)
+    - Store in buffer with preserved device timing
 
-2. _flush_buffer(): Re-anchor to current LSL time
-    - Get current LSL time: lsl_now = local_clock()
-    - Calculate how long ago samples should have arrived
-    - Shift all timestamps to anchor oldest sample appropriately
-    - Preserves relative device timing while ensuring proper LSL synchronization
-    - Prevents timestamp drift when device was powered on long before recording
+2. _flush_buffer(): Conditional re-anchoring (rare)
+    - Check if timestamps are already near current LSL time
+    - Only apply re-anchoring for edge cases (timestamps >30s in past)
+    - Preserves device timing precision while ensuring LSL compatibility
 
 Packet Reordering Buffer - Critical Design Component:
 ------------------------------------------------------
@@ -87,11 +136,11 @@ BLE transmission can REORDER entire messages (not just individual packets). Anal
 
 **BUFFER OPERATION:**
 
-1. Samples held in buffer for BUFFER_DURATION_SECONDS (default: 250ms)
+1. Samples held in buffer for BUFFER_DURATION_SECONDS (default: 150ms)
 2. When buffer time limit reached, all buffered samples are:
    - Concatenated across packets/messages
    - **Sorted by device timestamp** (preserves device timing, corrects arrival order)
-   - Converted to LSL time (device_timestamp + offset)
+   - **Timestamps already in LSL time domain** (no conversion needed)
    - Pushed as a single chunk to LSL
 3. LSL receives samples in correct temporal order with device timing preserved
 
@@ -102,10 +151,11 @@ BLE transmission can REORDER entire messages (not just individual packets). Anal
 
 **BUFFER SIZE RATIONALE:**
 - Original: 80ms (insufficient for ~90ms delays observed in data)
-- Current: 250ms (captures nearly all out-of-order messages)
-- Trade-off: Latency (250ms delay) vs. timestamp quality (monotonic output)
-- For real-time applications: reduce buffer size, accept some non-monotonic timestamps
-- For recording quality: keep 250ms+ buffer for perfect temporal ordering
+- Previous: 250ms (captures nearly all out-of-order messages)
+- Current: 150ms (balances low latency with high temporal ordering accuracy)
+- Trade-off: Latency (150ms delay) vs. timestamp quality (near-perfect monotonic output)
+- For real-time applications: can reduce further, accept some non-monotonic timestamps
+- For recording quality: 150ms provides excellent temporal ordering
 
 Timestamp Quality & Device Timing Preservation:
 ------------------------------------------------
@@ -167,13 +217,19 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Dict
 
 import bleak
 import numpy as np
 
 from .backends import _run
-from .decode import ACCGYRO_CHANNELS, EEG_CHANNELS, OPTICS_CHANNELS, parse_message
+from .decode import (
+    ACCGYRO_CHANNELS,
+    EEG_CHANNELS,
+    OPTICS_CHANNELS,
+    make_timestamps,
+    parse_message,
+)
 from .muse import MuseS
 from .utils import configure_lsl_api_cfg, get_utc_timestamp
 
@@ -198,11 +254,12 @@ OPTICS_LABELS: tuple[str, ...] = OPTICS_CHANNELS
 #   - Smaller buffer (80ms):  Lower latency, but ~1-2% non-monotonic timestamps in output
 #   - Larger buffer (250ms+): Higher latency, but nearly 0% non-monotonic (perfect ordering)
 #
-# Current: 250ms captures nearly all out-of-order messages while maintaining acceptable latency
-BUFFER_DURATION_SECONDS = 0.25
+# Current: 150ms balances low latency with high temporal ordering accuracy
+# With stream-relative timestamps, we can reduce from 250ms while maintaining quality
+BUFFER_DURATION_SECONDS = 0.15
 
 # Maximum number of BLE packets to buffer before forcing a flush (safety limit)
-MAX_BUFFER_PACKETS = 10
+MAX_BUFFER_PACKETS = 8
 
 
 @dataclass
@@ -245,6 +302,9 @@ def _create_stream_outlet(
         if channel_type:
             channel.append_child_value("type", channel_type)
 
+    # TODO: chunk_size=1 is much smaller than actual chunks pushed (38 EEG, 8 ACCGYRO, 10 Optics)
+    # due to 150ms buffering. Consider increasing to sampling_rate * BUFFER_DURATION_SECONDS
+    # for better network efficiency and receiver memory allocation.
     return StreamOutlet(info, chunk_size=1)
 
 
@@ -321,6 +381,10 @@ async def _stream_async(
 ) -> None:
     sensor_streams = _build_sensor_streams(enable_logging=outfile is not None)
     samples_sent = {name: 0 for name in sensor_streams}
+    # State for timestamping: sensor_type -> (base_time, wrap_offset, last_abs_tick, sample_counter)
+    timestamp_states: Dict[str, tuple[Optional[float], int, int, int]] = {
+        sensor: (None, 0, 0, 0) for sensor in sensor_streams.keys()
+    }
 
     # Compute device-to-LSL time offset once at the start
     # Will be updated with the first data packet
@@ -328,7 +392,7 @@ async def _stream_async(
 
     def _flush_buffer(sensor_type: str) -> None:
         """Flush reordering buffer for a specific sensor type: sort and push samples to LSL."""
-        nonlocal samples_sent
+        nonlocal samples_sent  # noqa: F824
 
         stream = sensor_streams[sensor_type]
         if len(stream.buffer) == 0:
@@ -345,43 +409,30 @@ async def _stream_async(
 
         # Re-anchor timestamps to current LSL time while preserving device timing
         #
-        # WHY: If the Muse device was powered on hours before LabRecorder started,
-        # the initial device_to_lsl_offset creates timestamps in the "past" relative
-        # to when recording actually begins. This causes sync issues with other devices.
-        #
-        # SOLUTION: Shift all timestamps so they're anchored to current LSL time,
-        # but preserve the relative timing between samples (device precision).
-        #
-        # BENEFITS:
-        # - Sub-millisecond device timing preserved (e.g., 4ms @ 250Hz)
-        # - Timestamps always near current LSL time (proper multi-device sync)
-        # - Compatible with LabRecorder clock offset collection
+        # With base_time = 0 in make_timestamps(), timestamps are now relative to
+        # stream start and should already be properly anchored to LSL time.
+        # Only apply re-anchoring if timestamps are significantly in the past.
         lsl_now = local_clock()
         first_timestamp = sorted_timestamps[0]
-        time_span = sorted_timestamps[-1] - first_timestamp
 
-        # Calculate how long ago these samples should have been captured
-        # Account for: sample time span + half the buffer duration (typical delay)
-        expected_age = time_span + BUFFER_DURATION_SECONDS / 2
-
-        # Compute anchor point: where the oldest sample should be
-        # (in the past by expected_age seconds from now)
-        anchor_time = lsl_now - expected_age
-
-        # Calculate shift needed to move timestamps from their current position
-        # to the anchored position
-        timestamp_shift = anchor_time - first_timestamp
-
-        # Apply uniform shift to all timestamps
-        # This preserves all relative timing from the device while anchoring to LSL time
-        anchored_timestamps = sorted_timestamps + timestamp_shift
+        # Skip re-anchoring if timestamps are already near current LSL time
+        # (within a reasonable window, e.g., last 30 seconds)
+        if first_timestamp >= lsl_now - 30.0:
+            anchored_timestamps = sorted_timestamps
+        else:
+            # Legacy re-anchoring for edge cases
+            time_span = sorted_timestamps[-1] - first_timestamp
+            expected_age = time_span + BUFFER_DURATION_SECONDS / 2
+            anchor_time = lsl_now - expected_age
+            timestamp_shift = anchor_time - first_timestamp
+            anchored_timestamps = sorted_timestamps + timestamp_shift
 
         # Push to LSL with re-anchored timestamps
         # This preserves device-level timing precision while ensuring proper
         # synchronization with LabRecorder and other LSL streams
         try:
             stream.outlet.push_chunk(
-                x=sorted_data.astype(np.float32, copy=False),
+                x=sorted_data.astype(np.float32, copy=False),  # type: ignore[arg-type]
                 timestamp=anchored_timestamps.astype(np.float64, copy=False),
                 pushThrough=True,
             )
@@ -452,11 +503,21 @@ async def _stream_async(
             _flush_buffer(sensor_type)
 
     def _on_data(_, data: bytearray):
-        nonlocal device_to_lsl_offset
+        nonlocal timestamp_states  # noqa: F824
         try:
             # Both EEG and ACC/GYRO data come through EEG characteristic
             message = f"{get_utc_timestamp()}\t{MuseS.EEG_UUID}\t{data.hex()}"
-            decoded = parse_message(message)
+            subpackets = parse_message(message)
+
+            # Apply timestamps for each sensor type
+            decoded = {}
+            for sensor_type, pkt_list in subpackets.items():
+                if sensor_type in timestamp_states:
+                    array, *new_state = make_timestamps(
+                        pkt_list, *timestamp_states[sensor_type]
+                    )
+                    decoded[sensor_type] = array
+                    timestamp_states[sensor_type] = (new_state[0], new_state[1], new_state[2], new_state[3])  # type: ignore
         except Exception as exc:
             if verbose:
                 print(f"Decoding error: {exc}")
