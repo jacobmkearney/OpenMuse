@@ -302,6 +302,9 @@ def _create_stream_outlet(
         if channel_type:
             channel.append_child_value("type", channel_type)
 
+    # TODO: chunk_size=1 is much smaller than actual chunks pushed (38 EEG, 8 ACCGYRO, 10 Optics)
+    # due to 150ms buffering. Consider increasing to sampling_rate * BUFFER_DURATION_SECONDS
+    # for better network efficiency and receiver memory allocation.
     return StreamOutlet(info, chunk_size=1)
 
 
