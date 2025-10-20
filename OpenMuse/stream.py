@@ -381,16 +381,16 @@ async def _stream_async(
 ) -> None:
     sensor_streams = _build_sensor_streams(enable_logging=outfile is not None)
     samples_sent = {name: 0 for name in sensor_streams}
-    # Shared state for timestamping across all sensor types
-    shared_timestamp_state = {"base_time": None, "wrap_offset": 0, "last_abs_tick": 0}
     # Per-sensor state: sensor_type -> sample_counter
-    timestamp_states = {
-        sensor: {"sample_counter": 0} for sensor in sensor_streams.keys()
+    timestamp_states: Dict[str, tuple[Optional[float], int, int, int]] = {
+        sensor: (None, 0, 0, 0) for sensor in sensor_streams.keys()
     }
 
     # Compute device-to-LSL time offset once at the start
     # Will be updated with the first data packet
-    device_to_lsl_offset = None
+    device_to_lsl_offset: Dict[str, Optional[float]] = {
+        sensor: None for sensor in sensor_streams.keys()
+    }
 
     def _flush_buffer(sensor_type: str) -> None:
         """Flush reordering buffer for a specific sensor type: sort and push samples to LSL."""
@@ -480,15 +480,18 @@ async def _stream_async(
 
         # Compute device-to-LSL time offset on first packet only
         # This offset maps device time to LSL time domain
-        if device_to_lsl_offset is None:
-            device_to_lsl_offset = lsl_now - device_times[0]
+        if device_to_lsl_offset[sensor_type] is None:
+            device_to_lsl_offset[sensor_type] = lsl_now - device_times[0]
             if verbose:
-                print(f"Initialized time offset: {device_to_lsl_offset:.3f} seconds")
+                print(
+                    f"Initialized time offset for {sensor_type}: "
+                    f"{device_to_lsl_offset[sensor_type]:.3f} seconds"
+                )
 
         # Convert device timestamps to LSL time
         # LSL time is the reference time domain used by all LSL streams
         # This ensures proper synchronization with other LSL streams in LabRecorder
-        lsl_timestamps = device_times + device_to_lsl_offset
+        lsl_timestamps = device_times + device_to_lsl_offset[sensor_type]
         stream.buffer.append((lsl_timestamps, samples))
 
         if stream.last_push_time is None:
@@ -505,7 +508,7 @@ async def _stream_async(
             _flush_buffer(sensor_type)
 
     def _on_data(_, data: bytearray):
-        nonlocal shared_timestamp_state, timestamp_states  # noqa: F824
+        nonlocal timestamp_states  # noqa: F824
         try:
             # Both EEG and ACC/GYRO data come through EEG characteristic
             message = f"{get_utc_timestamp()}\t{MuseS.EEG_UUID}\t{data.hex()}"
@@ -515,18 +518,18 @@ async def _stream_async(
             decoded = {}
             for sensor_type, pkt_list in subpackets.items():
                 if sensor_type in timestamp_states:
-                    array, *new_state = make_timestamps(
-                        pkt_list,
-                        shared_timestamp_state["base_time"],
-                        shared_timestamp_state["wrap_offset"],
-                        shared_timestamp_state["last_abs_tick"],
-                        timestamp_states[sensor_type]["sample_counter"],
+                    # Unpack full returned state for this sensor
+                    array, base_time, wrap_offset, last_abs_tick, sample_counter = (
+                        make_timestamps(pkt_list, *timestamp_states[sensor_type])
                     )
                     decoded[sensor_type] = array
-                    shared_timestamp_state["base_time"] = new_state[0]
-                    shared_timestamp_state["wrap_offset"] = new_state[1]
-                    shared_timestamp_state["last_abs_tick"] = new_state[2]
-                    timestamp_states[sensor_type]["sample_counter"] = new_state[3]
+                    # Store the full state tuple back for this sensor
+                    timestamp_states[sensor_type] = (
+                        base_time,
+                        wrap_offset,
+                        last_abs_tick,
+                        sample_counter,
+                    )
         except Exception as exc:
             if verbose:
                 print(f"Decoding error: {exc}")
