@@ -392,7 +392,7 @@ async def _stream_async(
 
     def _flush_buffer(sensor_type: str) -> None:
         """Flush reordering buffer for a specific sensor type: sort and push samples to LSL."""
-        nonlocal samples_sent
+        nonlocal samples_sent  # noqa: F824
 
         stream = sensor_streams[sensor_type]
         if len(stream.buffer) == 0:
@@ -503,7 +503,7 @@ async def _stream_async(
             _flush_buffer(sensor_type)
 
     def _on_data(_, data: bytearray):
-        nonlocal timestamp_states
+        nonlocal timestamp_states  # noqa: F824
         try:
             # Both EEG and ACC/GYRO data come through EEG characteristic
             message = f"{get_utc_timestamp()}\t{MuseS.EEG_UUID}\t{data.hex()}"
