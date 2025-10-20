@@ -381,9 +381,11 @@ async def _stream_async(
 ) -> None:
     sensor_streams = _build_sensor_streams(enable_logging=outfile is not None)
     samples_sent = {name: 0 for name in sensor_streams}
-    # State for timestamping: sensor_type -> (base_time, wrap_offset, last_abs_tick, sample_counter)
-    timestamp_states: Dict[str, tuple[Optional[float], int, int, int]] = {
-        sensor: (None, 0, 0, 0) for sensor in sensor_streams.keys()
+    # Shared state for timestamping across all sensor types
+    shared_timestamp_state = {"base_time": None, "wrap_offset": 0, "last_abs_tick": 0}
+    # Per-sensor state: sensor_type -> sample_counter
+    timestamp_states = {
+        sensor: {"sample_counter": 0} for sensor in sensor_streams.keys()
     }
 
     # Compute device-to-LSL time offset once at the start
@@ -503,7 +505,7 @@ async def _stream_async(
             _flush_buffer(sensor_type)
 
     def _on_data(_, data: bytearray):
-        nonlocal timestamp_states  # noqa: F824
+        nonlocal shared_timestamp_state, timestamp_states  # noqa: F824
         try:
             # Both EEG and ACC/GYRO data come through EEG characteristic
             message = f"{get_utc_timestamp()}\t{MuseS.EEG_UUID}\t{data.hex()}"
@@ -514,10 +516,17 @@ async def _stream_async(
             for sensor_type, pkt_list in subpackets.items():
                 if sensor_type in timestamp_states:
                     array, *new_state = make_timestamps(
-                        pkt_list, *timestamp_states[sensor_type]
+                        pkt_list,
+                        shared_timestamp_state["base_time"],
+                        shared_timestamp_state["wrap_offset"],
+                        shared_timestamp_state["last_abs_tick"],
+                        timestamp_states[sensor_type]["sample_counter"],
                     )
                     decoded[sensor_type] = array
-                    timestamp_states[sensor_type] = (new_state[0], new_state[1], new_state[2], new_state[3])  # type: ignore
+                    shared_timestamp_state["base_time"] = new_state[0]
+                    shared_timestamp_state["wrap_offset"] = new_state[1]
+                    shared_timestamp_state["last_abs_tick"] = new_state[2]
+                    timestamp_states[sensor_type]["sample_counter"] = new_state[3]
         except Exception as exc:
             if verbose:
                 print(f"Decoding error: {exc}")
