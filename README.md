@@ -2,6 +2,7 @@
 
 *The Open Python Muse S Athena EEG Decoder*
 
+[![CI](https://github.com/DominiqueMakowski/OpenMuse/actions/workflows/ci.yml/badge.svg)](https://github.com/DominiqueMakowski/OpenMuse/actions/workflows/ci.yml)
 [![Muse S Athena](media/device.webp)](https://eu.choosemuse.com/products/muse-s-athena)
 
 
