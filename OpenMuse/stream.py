@@ -91,33 +91,6 @@ The parse_message() function returns decoded data with THREE timestamp types:
    - Used for: Final LSL timestamps (after conversion)
    - These are the timestamps that appear in recorded XDF files
 
-Timestamp Conversion Flow:
----------------------------------------------------------------------
-    Device Time Domain              →           LSL Time Domain
-    ==================                          ===============
-
-    pkt_time (device seconds)                   LSL timestamps (seconds)
-           ↓                                             ↑
-    timestamps = pkt_time + Δt      →→→→→   Anchored timestamps
-                                             (preserving device timing)
-
-    Where:
-    - Timestamps start from 0 when streaming begins
-    - Device timing precision preserved through 256kHz clock tick differences
-    - Natural LSL synchronization without artificial re-anchoring
-
-The conversion happens in two stages:
-
-1. _queue_samples(): LSL time mapping
-    - Extract stream-relative timestamps from decoded data
-    - Add device_to_lsl_offset (maps stream start to LSL time)
-    - Store in buffer with preserved device timing
-
-2. _flush_buffer(): Conditional re-anchoring (rare)
-    - Check if timestamps are already near current LSL time
-    - Only apply re-anchoring for edge cases (timestamps >30s in past)
-    - Preserves device timing precision while ensuring LSL compatibility
-
 Packet Reordering Buffer - Critical Design Component:
 ------------------------------------------------------
 **WHY BUFFERING IS NECESSARY:**
@@ -273,6 +246,12 @@ class SensorStream:
     last_push_time: Optional[float] = None
     log_records: Optional[list[tuple[np.ndarray, np.ndarray]]] = None
 
+    # State for make_timestamps()
+    base_time: Optional[float] = None
+    wrap_offset: int = 0
+    last_abs_tick: int = 0
+    sample_counter: int = 0
+
 
 def _create_stream_outlet(
     name: str,
@@ -381,13 +360,8 @@ async def _stream_async(
 ) -> None:
     sensor_streams = _build_sensor_streams(enable_logging=outfile is not None)
     samples_sent = {name: 0 for name in sensor_streams}
-    # State for timestamping: sensor_type -> (base_time, wrap_offset, last_abs_tick, sample_counter)
-    timestamp_states: Dict[str, tuple[Optional[float], int, int, int]] = {
-        sensor: (None, 0, 0, 0) for sensor in sensor_streams.keys()
-    }
 
-    # Compute device-to-LSL time offset once at the start
-    # Will be updated with the first data packet
+    # Single global offset for all sensors (they share the same device clock)
     device_to_lsl_offset = None
 
     def _flush_buffer(sensor_type: str) -> None:
@@ -454,7 +428,7 @@ async def _stream_async(
     def _queue_samples(
         sensor_type: str, data_array: np.ndarray, lsl_now: float
     ) -> None:
-        nonlocal device_to_lsl_offset
+        nonlocal device_to_lsl_offset  # Access global offset
 
         if data_array.size == 0 or data_array.shape[1] < 2:
             return
@@ -476,16 +450,16 @@ async def _stream_async(
 
         device_times = data_array[:, 0]
 
-        # Compute device-to-LSL time offset on first packet only
-        # This offset maps device time to LSL time domain
+        # Compute device-to-LSL time offset on first packet (ANY sensor)
         if device_to_lsl_offset is None:
             device_to_lsl_offset = lsl_now - device_times[0]
             if verbose:
-                print(f"Initialized time offset: {device_to_lsl_offset:.3f} seconds")
+                print(
+                    f"Initialized global time offset: "
+                    f"{device_to_lsl_offset:.3f} seconds (from {sensor_type})"
+                )
 
         # Convert device timestamps to LSL time
-        # LSL time is the reference time domain used by all LSL streams
-        # This ensures proper synchronization with other LSL streams in LabRecorder
         lsl_timestamps = device_times + device_to_lsl_offset
         stream.buffer.append((lsl_timestamps, samples))
 
@@ -503,25 +477,34 @@ async def _stream_async(
             _flush_buffer(sensor_type)
 
     def _on_data(_, data: bytearray):
-        nonlocal timestamp_states  # noqa: F824
-        try:
-            # Both EEG and ACC/GYRO data come through EEG characteristic
-            message = f"{get_utc_timestamp()}\t{MuseS.EEG_UUID}\t{data.hex()}"
-            subpackets = parse_message(message)
+        message = f"{get_utc_timestamp()}\t{MuseS.EEG_UUID}\t{data.hex()}"
+        subpackets = parse_message(message)
 
-            # Apply timestamps for each sensor type
-            decoded = {}
-            for sensor_type, pkt_list in subpackets.items():
-                if sensor_type in timestamp_states:
-                    array, *new_state = make_timestamps(
-                        pkt_list, *timestamp_states[sensor_type]
-                    )
-                    decoded[sensor_type] = array
-                    timestamp_states[sensor_type] = (new_state[0], new_state[1], new_state[2], new_state[3])  # type: ignore
-        except Exception as exc:
-            if verbose:
-                print(f"Decoding error: {exc}")
-            return
+        decoded = {}
+        for sensor_type, pkt_list in subpackets.items():
+            if sensor_type in sensor_streams:
+                # --- UPDATE THIS LOGIC ---
+                stream = sensor_streams[sensor_type]
+
+                # 1. Get current state from the stream object
+                current_state = (
+                    stream.base_time,
+                    stream.wrap_offset,
+                    stream.last_abs_tick,
+                    stream.sample_counter,
+                )
+
+                # 2. Call make_timestamps with the correct state
+                array, base_time, wrap_offset, last_abs_tick, sample_counter = (
+                    make_timestamps(pkt_list, *current_state)
+                )
+                decoded[sensor_type] = array
+
+                # 3. Update the state on the stream object
+                stream.base_time = base_time
+                stream.wrap_offset = wrap_offset
+                stream.last_abs_tick = last_abs_tick
+                stream.sample_counter = sample_counter
 
         lsl_now = local_clock()
 

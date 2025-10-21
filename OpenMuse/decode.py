@@ -790,10 +790,22 @@ def make_timestamps(
             raw_tick = subpkt.get("pkt_time_raw", first_raw_tick)
 
             # Expand 32-bit tick into monotonically increasing absolute tick
+            tick_diff = raw_tick - last_abs_tick
             abs_tick = raw_tick + wrap_offset
+
+            # Only trigger wraparound for LARGE backward jumps (> 10000 seconds)
+            # Small backward jumps (< 1 second) are timing inversions, not wraparounds
+            WRAPAROUND_THRESHOLD = -10000 * DEVICE_CLOCK_HZ  # -10000 seconds in tick
+
             if abs_tick < last_abs_tick:
-                wrap_offset += clock_mod
-                abs_tick = raw_tick + wrap_offset
+                if tick_diff < WRAPAROUND_THRESHOLD:
+                    # True wraparound: huge backward jump
+                    wrap_offset += clock_mod
+                    abs_tick = raw_tick + wrap_offset
+                # else: small timing inversion, ignore and keep monotonicity
+                else:
+                    abs_tick = last_abs_tick  # Force monotonic
+
             last_abs_tick = abs_tick
 
             # Use high-precision arithmetic to avoid floating point accumulation errors

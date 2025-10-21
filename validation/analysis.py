@@ -6,11 +6,13 @@ import pandas as pd
 import requests
 import pyxdf
 import warnings
+import neurokit2 as nk
 
 
 # Contains .xdf files recorded with LabRecorder, containing Muse data streams (recorded using the stream function, preset 1041) and a Bitalino stream with ECG and Photosensor data.
 # Was recorded during a face presentation experiment.
 filename = "./faces1.xdf"
+filename = "./test-06.xdf"
 upsample = 2.0
 fillmissing = None
 
@@ -24,6 +26,84 @@ streams, header = pyxdf.load_xdf(
 
 # Get smaller time stamp to later use as offset (zero point)
 min_ts = min([min(s["time_stamps"]) for s in streams if len(s["time_stamps"]) > 0])
+
+# Get range of timestamps for each stream
+for i, stream in enumerate(streams):
+    name = stream["info"].get("name", ["Unnamed"])[0]
+    if len(stream["time_stamps"]) == 0:
+        print(f"{i} - Stream {name}: empty")
+        continue
+    ts_min = stream["time_stamps"].min()
+    ts_max = stream["time_stamps"].max()
+    duration = ts_max - ts_min
+    n_samples = len(stream["time_stamps"])
+    nominal_srate = float(stream["info"]["nominal_srate"][0])
+    effective_srate = float(stream["info"]["effective_srate"])
+    print(
+        f"{i} - Stream {name}: {n_samples} samples, duration {duration:.2f} s (from {ts_min:.2f} to {ts_max:.2f}), nominal srate {nominal_srate:.2f} Hz, effective srate {effective_srate:.2f} Hz"
+    )
+
+
+# ========================================================================================
+# Test the proximity of eletronic markers vs. Photosensor ones
+# ========================================================================================
+stream = streams[3]
+jspsych_events = np.array([float(val[0]) for val in stream["time_series"]])
+jspsych_onsets = jspsych_events == 1
+jspsych_ts = np.array(stream["time_stamps"])
+jspsych_ts_onset = jspsych_ts[jspsych_onsets]
+jspsych_duration = jspsych_ts[jspsych_events == 0] - jspsych_ts_onset[:-1]
+
+
+stream = streams[4]
+# LUX is 4th column
+# stream["info"]["desc"][0]["channels"][0]["channel"]
+lux_signal = stream["time_series"][:, 3]
+# nk.signal_plot(lux_signal)
+lux_events = nk.events_find(
+    lux_signal, threshold_keep="below", duration_min=1500, duration_max=2500
+)
+lux_ts = stream["time_stamps"]
+lux_ts_onset = lux_ts[lux_events["onset"].astype(int)]
+
+# lot a vertical lines from 0 to 0.5 and from 0.5 to 1 for each jspsych and lux onset
+plt.figure()
+for i in range(20):
+    plt.vlines(
+        (jspsych_ts_onset[i] - min_ts), 0.5, 1, color="red", label="JSpsych onsets"
+    )
+    plt.vlines(
+        (lux_ts_onset[i] - min_ts), 0, 1, color="blue", label="Photosensor onsets"
+    )
+
+delays = jspsych_ts_onset[0:-1] - lux_ts_onset[1::]
+plt.hist(delays, bins=50)
+
+# ========================================================================================
+# Test GYRO sync
+# ========================================================================================
+# LUX is 4th column
+# streams[4]["info"]["desc"][0]["channels"][0]["channel"]
+lux_signal = streams[4]["time_series"][:, 3]
+# nk.signal_plot(lux_signal)
+lux_events = nk.events_find(
+    lux_signal, threshold_keep="below", duration_min=1500, duration_max=2500
+)
+lux_ts = streams[4]["time_stamps"]
+lux_ts_onset = lux_ts[lux_events["onset"].astype(int)]
+
+# GYRO
+accgyro = pd.DataFrame(
+    streams[1]["time_series"],
+    columns=[
+        ch["label"][0] for ch in streams[1]["info"]["desc"][0]["channels"][0]["channel"]
+    ],
+)
+accgyro.index = streams[1]["time_stamps"]
+
+accgyro.iloc[:3000].plot(y=["GYRO_X"], subplots=True)
+for ts in lux_ts_onset[0:11]:
+    plt.axvline(x=ts, color="red", linestyle="--")
 
 # ========================================================================================
 # PRECISION-PRESERVING APPROACH: Work with numpy arrays and float timestamps
