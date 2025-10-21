@@ -252,9 +252,6 @@ class SensorStream:
     last_abs_tick: int = 0
     sample_counter: int = 0
 
-    # State for LSL time conversion
-    device_to_lsl_offset: Optional[float] = None
-
 
 def _create_stream_outlet(
     name: str,
@@ -364,6 +361,9 @@ async def _stream_async(
     sensor_streams = _build_sensor_streams(enable_logging=outfile is not None)
     samples_sent = {name: 0 for name in sensor_streams}
 
+    # Single global offset for all sensors (they share the same device clock)
+    device_to_lsl_offset = None
+
     def _flush_buffer(sensor_type: str) -> None:
         """Flush reordering buffer for a specific sensor type: sort and push samples to LSL."""
         nonlocal samples_sent  # noqa: F824
@@ -428,6 +428,7 @@ async def _stream_async(
     def _queue_samples(
         sensor_type: str, data_array: np.ndarray, lsl_now: float
     ) -> None:
+        nonlocal device_to_lsl_offset  # Access global offset
 
         if data_array.size == 0 or data_array.shape[1] < 2:
             return
@@ -449,17 +450,17 @@ async def _stream_async(
 
         device_times = data_array[:, 0]
 
-        # Compute device-to-LSL time offset on first packet only
-        if stream.device_to_lsl_offset is None:
-            stream.device_to_lsl_offset = lsl_now - device_times[0]
+        # Compute device-to-LSL time offset on first packet (ANY sensor)
+        if device_to_lsl_offset is None:
+            device_to_lsl_offset = lsl_now - device_times[0]
             if verbose:
                 print(
-                    f"Initialized time offset for {sensor_type}: "
-                    f"{stream.device_to_lsl_offset:.3f} seconds"
+                    f"Initialized global time offset: "
+                    f"{device_to_lsl_offset:.3f} seconds (from {sensor_type})"
                 )
 
         # Convert device timestamps to LSL time
-        lsl_timestamps = device_times + stream.device_to_lsl_offset
+        lsl_timestamps = device_times + device_to_lsl_offset
         stream.buffer.append((lsl_timestamps, samples))
 
         if stream.last_push_time is None:
