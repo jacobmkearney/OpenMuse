@@ -143,12 +143,15 @@ class TestStreamingSimulation(unittest.TestCase):
         # In real LSL, this would account for device-to-LSL offset and network delays
         import time as time_module
 
-        lsl_now = time_module.time()
         if len(sorted_timestamps) > 0:
-            # Calculate offset as difference between LSL time and first device timestamp
-            # This simulates the time synchronization that happens in real LSL streaming
-            device_to_lsl_offset = lsl_now - sorted_timestamps[0]
-            anchored_timestamps = sorted_timestamps + device_to_lsl_offset
+            # Calculate offset once at the beginning of streaming session
+            if self.device_to_lsl_offset is None:
+                lsl_now = time_module.time()
+                # Calculate offset as difference between LSL time and first device timestamp
+                # This simulates the time synchronization that happens in real LSL streaming
+                self.device_to_lsl_offset = lsl_now - sorted_timestamps[0]
+
+            anchored_timestamps = sorted_timestamps + self.device_to_lsl_offset
         else:
             anchored_timestamps = sorted_timestamps
 
@@ -211,6 +214,40 @@ class TestStreamingSimulation(unittest.TestCase):
         )
 
         return json_data
+
+    def _simulate_queue_samples(
+        self,
+        sensor_type: str,
+        data_array: np.ndarray,
+        current_time: float,
+    ) -> None:
+        """Simulate sample queuing logic from stream.py."""
+        stream = self.sensor_streams[sensor_type]
+        if data_array.size == 0 or data_array.shape[1] < 2:
+            return
+
+        # Extract sensor data (exclude time column)
+        samples = data_array[:, 1:].astype(np.float32)
+        if stream.pad_to_channels:
+            target = stream.pad_to_channels
+            current = samples.shape[1]
+            if current < target:
+                padding = np.zeros(
+                    (samples.shape[0], target - current), dtype=np.float32
+                )
+                samples = np.hstack([samples, padding])
+            elif current > target:
+                samples = samples[:, :target]
+
+        # Use device timestamps directly (simplified for testing)
+        device_times = data_array[:, 0]
+
+        # Add to buffer
+        stream.buffer.append((device_times, samples))
+
+        # Simple buffer management: flush if buffer gets too large
+        if len(stream.buffer) >= 5:  # Smaller threshold for testing
+            self._simulate_buffer_flush(sensor_type)
 
     def _simulate_queue_samples_with_logging(
         self,
