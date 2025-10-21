@@ -147,6 +147,9 @@ class RealtimeViewer:
         update_interval: float = 0.005,
         duration: Optional[float] = None,
         verbose: bool = True,
+        groups: Optional[Sequence[str]] = None,
+        channels: Optional[Sequence[str]] = None,
+        scaling_mode: str = "group",
     ):
         self.streams = streams
         self.window_size = window_size
@@ -154,6 +157,13 @@ class RealtimeViewer:
         self.duration = duration
         self.verbose = verbose
         self.start_time = time.time()
+        self.scaling_mode = scaling_mode
+
+        # Normalize filters (upper-case)
+        self.filter_groups = set(g.upper() for g in groups) if groups else None
+        self.filter_channels = (
+            set(c.upper() for c in channels) if channels else None
+        )
 
         # Collect channel info from all streams
         # First, detect active channels (non-zero variance)
@@ -186,6 +196,29 @@ class RealtimeViewer:
             for ch_idx, ch_name in enumerate(stream.info.ch_names):
                 # Skip inactive channels (zero-padded)
                 if not self.active_channels[stream_idx][ch_idx]:
+                    continue
+
+                # Determine group type for filtering
+                if is_eeg:
+                    ch_group = "EEG"
+                elif is_optics:
+                    ch_group = "OPTICS"
+                elif "ACC" in ch_name.upper():
+                    ch_group = "ACC"
+                else:
+                    ch_group = "GYRO"
+
+                # Apply group filter if provided
+                if self.filter_groups is not None:
+                    # Allow ACCGYRO to include both ACC and GYRO if specified
+                    if (
+                        ch_group not in self.filter_groups
+                        and "ACCGYRO" not in self.filter_groups
+                    ):
+                        continue
+
+                # Apply channel-name filter if provided
+                if self.filter_channels is not None and ch_name.upper() not in self.filter_channels:
                     continue
                 # Determine color and display range (for proper scaling)
                 # Range is the total vertical span; signals will be centered around their mean
@@ -352,7 +385,12 @@ class RealtimeViewer:
             print(f"  Window size: {window_size}s")
             print(f"  Update rate: {1/update_interval:.0f} Hz")
             print("\nPress '+' or '-' to zoom time axis")
-            print("Scroll mouse wheel to zoom amplitude")
+            if self.scaling_mode == "group":
+                print("Scroll: zoom amplitude for the channel group under the cursor")
+            elif self.scaling_mode == "channel":
+                print("Scroll: zoom amplitude for the channel under the cursor")
+            else:
+                print("Scroll: zoom amplitude for all channels (global)")
             print("Close window to stop.\n")
 
     def _create_vertex_data(self):
@@ -452,19 +490,19 @@ class RealtimeViewer:
 
         # Draw y-limit lines (horizontal lines at min/max of each channel)
         if len(self.y_limit_lines) > 0:
-            gloo.set_line_width(1.0)
+            gloo.set_line_width(1.25)
             self.grid_program["a_position"] = self.y_limit_lines
-            self.grid_program["u_color"] = (0.25, 0.25, 0.25, 1.0)  # Dark gray
+            self.grid_program["u_color"] = (0.22, 0.22, 0.22, 1.0)  # Darker gray
             self.grid_program.draw("lines")
 
         # Draw zero lines (center of each channel) - thicker and lighter
-        gloo.set_line_width(2.0)
+        gloo.set_line_width(2.25)
         self.grid_program["a_position"] = self.zero_lines
-        self.grid_program["u_color"] = (0.35, 0.35, 0.35, 1.0)  # Lighter gray, thicker
+        self.grid_program["u_color"] = (0.5, 0.5, 0.5, 1.0)  # Lighter gray, thicker
         self.grid_program.draw("lines")
 
         # Reset line width for signal drawing
-        gloo.set_line_width(1.0)
+        gloo.set_line_width(1.5)
 
         # Draw each channel separately to avoid connecting them
         for index_buffer in self.index_buffers:
@@ -687,7 +725,7 @@ class RealtimeViewer:
             self.canvas.update()
 
     def on_mouse_wheel(self, event):
-        """Handle mouse wheel for amplitude zoom (per channel group under mouse)."""
+        """Handle mouse wheel for amplitude zoom based on scaling mode."""
         # event.delta can be a tuple or have different structures depending on platform
         try:
             if hasattr(event.delta, "__getitem__"):
@@ -703,42 +741,50 @@ class RealtimeViewer:
             target_ch = self._get_channel_at_y(mouse_y) if mouse_y is not None else None
 
             if target_ch is not None:
-                # Find the channel group (channels from same stream with similar type)
-                target_info = self.channel_info[target_ch]
-                target_name = target_info["name"]
-
-                # Determine group type
-                if "EEG" in target_name.upper():
-                    group_type = "EEG"
-                elif "OPTICS" in target_name.upper():
-                    group_type = "OPTICS"
-                elif "ACC" in target_name.upper():
-                    group_type = "ACC"
-                elif "GYRO" in target_name.upper():
-                    group_type = "GYRO"
-                else:
-                    group_type = None
-
-                # Scale all channels in the same group
                 dy = np.sign(delta) * 0.1
-                for ch_info in self.channel_info:
-                    ch_name = ch_info["name"]
-                    is_same_group = False
 
-                    if group_type == "EEG" and "EEG" in ch_name.upper():
-                        is_same_group = True
-                    elif group_type == "OPTICS" and "OPTICS" in ch_name.upper():
-                        is_same_group = True
-                    elif group_type == "ACC" and "ACC" in ch_name.upper():
-                        is_same_group = True
-                    elif group_type == "GYRO" and "GYRO" in ch_name.upper():
-                        is_same_group = True
-
-                    if is_same_group:
-                        # Update this channel's scale
+                if self.scaling_mode == "channel":
+                    # Only scale the channel under the cursor
+                    current_scale = self.channel_info[target_ch]["y_scale"]
+                    new_scale = max(0.5, min(5.0, current_scale * np.exp(dy)))
+                    self.channel_info[target_ch]["y_scale"] = new_scale
+                elif self.scaling_mode == "global":
+                    # Scale all channels
+                    for ch_info in self.channel_info:
                         current_scale = ch_info["y_scale"]
                         new_scale = max(0.5, min(5.0, current_scale * np.exp(dy)))
                         ch_info["y_scale"] = new_scale
+                else:
+                    # Scale by group type of channel under the cursor
+                    target_info = self.channel_info[target_ch]
+                    target_name = target_info["name"]
+                    if "EEG" in target_name.upper():
+                        group_type = "EEG"
+                    elif "OPTICS" in target_name.upper():
+                        group_type = "OPTICS"
+                    elif "ACC" in target_name.upper():
+                        group_type = "ACC"
+                    elif "GYRO" in target_name.upper():
+                        group_type = "GYRO"
+                    else:
+                        group_type = None
+
+                    for ch_info in self.channel_info:
+                        ch_name = ch_info["name"]
+                        is_same_group = False
+                        if group_type == "EEG" and "EEG" in ch_name.upper():
+                            is_same_group = True
+                        elif group_type == "OPTICS" and "OPTICS" in ch_name.upper():
+                            is_same_group = True
+                        elif group_type == "ACC" and "ACC" in ch_name.upper():
+                            is_same_group = True
+                        elif group_type == "GYRO" and "GYRO" in ch_name.upper():
+                            is_same_group = True
+
+                        if is_same_group:
+                            current_scale = ch_info["y_scale"]
+                            new_scale = max(0.5, min(5.0, current_scale * np.exp(dy)))
+                            ch_info["y_scale"] = new_scale
 
                 # Regenerate y-tick labels with new scales
                 self._update_y_tick_labels()
@@ -898,6 +944,9 @@ def view(
     duration: Optional[float] = None,
     window_size: float = 10.0,
     update_interval: float = 0.005,
+    groups: Optional[Sequence[str]] = None,
+    channels: Optional[Sequence[str]] = None,
+    scaling_mode: str = "group",
     verbose: bool = True,
 ) -> None:
     """
@@ -918,6 +967,9 @@ def view(
     - duration: Optional viewing duration in seconds. Omit to view until window closed.
     - window_size: Time window to display in seconds (default: 10.0)
     - update_interval: Update interval in seconds (default: 0.005 = 200 Hz)
+    - groups: Optional list of channel groups to display (EEG, OPTICS, ACC, GYRO, ACCGYRO)
+    - channels: Optional list of specific channel names to include (e.g., EEG_TP9, ACC_X)
+    - scaling_mode: 'group' (default), 'channel', or 'global' amplitude zoom behavior
     - verbose: Print progress messages
     """
     # Configure LSL to reduce verbosity (disables IPv6 warnings and lowers log level)
@@ -969,6 +1021,9 @@ def view(
         window_size=window_size,
         update_interval=update_interval,
         duration=duration,
+        groups=groups,
+        channels=channels,
+        scaling_mode=scaling_mode,
         verbose=verbose,
     )
     viewer.show()

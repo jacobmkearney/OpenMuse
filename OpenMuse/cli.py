@@ -132,6 +132,32 @@ def main(argv=None):
         help="Name of specific LSL stream to visualize (default: None = show all available streams: Muse_EEG + Muse_ACCGYRO)",
     )
     p_view.add_argument(
+        "--groups",
+        default=None,
+        help=(
+            "Comma-separated channel groups to display (case-insensitive). "
+            "Options: EEG, OPTICS, ACC, GYRO, ACCGYRO. Default: all"
+        ),
+    )
+    p_view.add_argument(
+        "--channels",
+        default=None,
+        help=(
+            "Comma-separated channel names to include (e.g., EEG_TP9,ACC_X). "
+            "Matches are case-insensitive. Default: include all in selected groups"
+        ),
+    )
+    p_view.add_argument(
+        "--scaling",
+        default="group",
+        choices=["group", "channel", "global"],
+        help=(
+            "Y-axis scaling mode: 'group' (zoom all in group under mouse), "
+            "'channel' (zoom only channel under mouse), or 'global' (zoom all channels). "
+            "Default: group"
+        ),
+    )
+    p_view.add_argument(
         "--window",
         "-w",
         type=float,
@@ -154,10 +180,25 @@ def main(argv=None):
         if ns.duration is not None and ns.duration <= 0:
             parser.error("--duration must be positive when provided")
 
+        # Parse comma-separated options into lists (None if not provided)
+        groups = (
+            [s.strip() for s in ns.groups.split(",") if s.strip()]
+            if ns.groups
+            else None
+        )
+        channels = (
+            [s.strip() for s in ns.channels.split(",") if s.strip()]
+            if ns.channels
+            else None
+        )
+
         view(
             stream_name=ns.stream_name,
             duration=ns.duration,
             window_size=ns.window,
+            groups=groups,
+            channels=channels,
+            scaling_mode=ns.scaling,
             verbose=True,
         )
         return 0
