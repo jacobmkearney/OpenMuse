@@ -7,4 +7,4 @@ from .decode import parse_message, decode_rawdata
 from .stream import stream
 from .view import view
 
-__version__ = "0.2.0"
+__version__ = "0.1.3"

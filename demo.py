@@ -22,4 +22,27 @@ fig = data["ACCGYRO"].plot(
     title="ACC + GYRO Movement Data",
 )
 
-plt.savefig("example_accgyro.png")
+plt.savefig("media/example_accgyro.png")
+
+fig = data["EEG"].plot(
+    x="time",
+    y=["EEG_TP9", "EEG_AF7", "EEG_AF8", "EEG_TP10"],
+    subplots=True,
+    title="EEG Data",
+)
+
+
+import OpenMuse
+
+# 90-second test raw data with ACCGYRO and EEG
+with open("tests/test_data/test_accgyro.txt", "r", encoding="utf-8") as f:
+    messages = f.readlines()
+data = OpenMuse.decode_rawdata(messages)
+print(f"EEG timestamp: {min(data['EEG']['time'])} - {max(data['EEG']['time'])}")
+print(
+    f"ACCGYRO timestamp: {min(data['ACCGYRO']['time'])} - {max(data['ACCGYRO']['time'])}"
+)
+print(f"Optics timestamp: {min(data['Optics']['time'])} - {max(data['Optics']['time'])}")
+# > EEG timestamp: 0.0 - 90.828125
+# > ACCGYRO timestamp: 0.0 - 90.65384615384616
+# > Optics timestamp: 0.0 - 90.71875

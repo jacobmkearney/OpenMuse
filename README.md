@@ -2,6 +2,7 @@
 
 *The Open Python Muse S Athena EEG Decoder*
 
+[![CI](https://github.com/DominiqueMakowski/OpenMuse/actions/workflows/ci.yml/badge.svg)](https://github.com/DominiqueMakowski/OpenMuse/actions/workflows/ci.yml)
 [![Muse S Athena](media/device.webp)](https://eu.choosemuse.com/products/muse-s-athena)
 
 
@@ -115,9 +116,7 @@ To stream data over LSL, use:
 OpenMuse stream --address <your-muse-address>
 ```
 
-This creates **two separate LSL streams**:
-- **Muse_EEG**: 4 EEG channels (TP9, AF7, AF8, TP10) at 256 Hz in microvolts
-- **Muse_ACCGYRO**: 6 motion channels (ACC_X/Y/Z, GYRO_X/Y/Z) at 52 Hz
+This creates **separate LSL streams** for groups of channels (`Muse_EEG`,  `Muse_ACCGYRO`, etc.).
 
 The following options are available:
 - `--address`: The MAC address of your Muse device (required)
@@ -151,7 +150,7 @@ Muse S Athena specs (From the [Muse website](https://eu.choosemuse.com/products/
 
 | Presets                                 | EEG   | Optics   | ACC/GYRO | Battery | Red LED |
 |-----------------------------------------|:-----:|:--------:|:--------:|:-------:|:--------|
-| p20, p21, p50, p51, p60, p61            | EEG4  |          |    X     |    X    |   off   |
+| p20, p21, p50, p51, p60, p61            | EEG4  |   —      |    X     |    X    |   off   |
 | p1034, p1043                            | EEG8  | Optics8  |    X     |    X    | bright  |
 | p1044                                   | EEG8  | Optics8  |    X     |    X    |  dim    |
 | p1035                                   | EEG4  | Optics4  |    X     |    X    |  dim    |
